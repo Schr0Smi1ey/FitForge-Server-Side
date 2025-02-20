@@ -30,6 +30,7 @@ const client = new MongoClient(uri, {
 const database = client.db("FitForge");
 const userCollection = database.collection("Users");
 const subscriberCollection = database.collection("NewsLetterSubscribers");
+const classCollection = database.collection("Classes");
 
 async function run() {
   try {
@@ -56,6 +57,19 @@ async function run() {
       res.send(result);
     });
 
+    // Classes
+    app.post("/classes", async (req, res) => {
+      const newClass = req.body;
+      const result = await classCollection.insertOne(newClass);
+      res.send(result);
+    });
+
+    app.get("/classes", async (req, res) => {
+      const cursor = classCollection.find();
+      const result = await cursor.toArray();
+      res.send(result);
+    });
+
     // Newsletter Subscribers
     app.post("/subscribers", async (req, res) => {
       const newSubscriber = req.body;
@@ -69,7 +83,6 @@ async function run() {
       const result = await subscriberCollection.insertOne(newSubscriber);
       res.send(result);
     });
-
     app.get("/subscribers", async (req, res) => {
       const cursor = subscriberCollection.find();
       const result = await cursor.toArray();
