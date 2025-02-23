@@ -63,6 +63,7 @@ async function run() {
     // Classes
     app.post("/classes", async (req, res) => {
       const newClass = req.body;
+      console.log(newClass);
       const result = await classesCollection.insertOne(newClass);
       res.send(result);
     });
@@ -81,11 +82,65 @@ async function run() {
     });
 
     app.get("/forums", async (req, res) => {
-      const cursor = forumsCollection.find();
-      const result = await cursor.toArray();
-      res.send(result);
+      try {
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 6;
+        const skip = (page - 1) * limit;
+
+        const posts = await forumsCollection
+          .find()
+          .sort({ "postedDate.date2": -1 })
+          .skip(skip)
+          .limit(limit)
+          .toArray();
+
+        const formattedPosts = posts.map(({ postedDate, ...rest }) => ({
+          ...rest,
+          date1: postedDate?.date1 || null,
+          date2: postedDate?.date2 || null,
+        }));
+
+        const totalPosts = await forumsCollection.countDocuments();
+
+        return res.json({
+          posts: formattedPosts,
+          totalPages: Math.ceil(totalPosts / limit),
+          currentPage: page,
+        });
+      } catch (error) {
+        console.error("Error fetching forums:", error);
+        res.status(500).json({ error: "Internal server error" });
+      }
     });
 
+    app.patch("/voteForums", async (req, res) => {
+      const { forumId, vote } = req.body;
+      console.log(forumId, vote);
+      const post = await forumsCollection.findOne({
+        _id: new ObjectId(forumId),
+      });
+      if (!post) {
+        return res.status(404).json({ error: "Post not found" });
+      }
+      const { totalUpVote, totalDownVote } = post;
+      let updatedUpvotes = totalUpVote;
+      let updatedDownvotes = totalDownVote;
+      if (vote === "up") {
+        updatedUpvotes += 1;
+      } else if (vote === "down") {
+        updatedDownvotes += 1;
+      }
+      const result = await forumsCollection.updateOne(
+        { _id: new ObjectId(forumId) },
+        {
+          $set: {
+            totalUpVote: updatedUpvotes,
+            totalDownVote: updatedDownvotes,
+          },
+        }
+      );
+      return res.json(result);
+    });
     // Trainers
     app.post("/trainers", async (req, res) => {
       try {
