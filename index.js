@@ -90,11 +90,38 @@ async function run() {
     app.post("/trainers", async (req, res) => {
       try {
         const trainerData = req.body;
+        console.log(trainerData);
         const user = await usersCollection.findOne({
-          email: trainerData.email,
+          email: { $regex: new RegExp(`^${trainerData.email}$`, "i") },
         });
-        trainerData.userId = user._id;
 
+        console.log(user);
+        if (!user) {
+          return res.send({ error: "User not found" });
+        }
+        trainerData.userId = user._id;
+        const trainer = await trainersCollection.findOne({ userId: user._id });
+        if (trainer) {
+          const appliedTrainerDocs = await appliedTrainersCollection
+            .find({ userId: user._id })
+            .toArray();
+          const pendingApplication = appliedTrainerDocs.find(
+            (app) => app.status === "pending"
+          );
+          if (pendingApplication) {
+            return res.send({
+              error: "Your application is still in progress!",
+            });
+          }
+          const acceptedApplication = appliedTrainerDocs.find(
+            (app) => app.status === "accepted"
+          );
+          if (acceptedApplication) {
+            return res.send({
+              error: "You are already a trainer with FitForge!",
+            });
+          }
+        }
         const trainerInsertResult = await trainersCollection.insertOne(
           trainerData
         );
@@ -121,8 +148,31 @@ async function run() {
     });
     app.get("/appliedTrainers", async (req, res) => {
       try {
+        const applicantEmail = req.query.email;
+        if (applicantEmail) {
+          const user = await usersCollection.findOne({
+            email: { $regex: new RegExp(`^${applicantEmail}$`, "i") },
+          });
+          const appliedTrainer = await appliedTrainersCollection
+            .find({ userId: user._id })
+            .toArray();
+          if (!appliedTrainer.length) {
+            return res.send({ error: "No application found" });
+          }
+          const trainer = await trainersCollection.findOne({
+            _id: appliedTrainer[0].applicationId,
+          });
+          return res.send([
+            {
+              user,
+              trainer,
+              appliedTrainer,
+            },
+          ]);
+        }
+
         const appliedTrainers = await appliedTrainersCollection
-          .find()
+          .find({ status: "pending" })
           .toArray();
 
         if (!appliedTrainers.length) {
@@ -157,10 +207,36 @@ async function run() {
           status: appliedTrainer.status,
           feedback: appliedTrainer.feedback,
         }));
-
+        console.log(response);
         res.send(response);
       } catch (error) {
         console.error("Error fetching applied trainers:", error);
+        res.status(500).send({ message: "Internal Server Error" });
+      }
+    });
+    app.patch("/handleApplication", async (req, res) => {
+      try {
+        const handleData = req.body;
+        console.log(handleData);
+        const status = handleData.status;
+        const applicationId = handleData.applicationId;
+        const userId = handleData.userId;
+        let feedback = "";
+        if (status === "rejected") {
+          feedback = handleData.feedback;
+        }
+        const resultAppliedTrainer = await appliedTrainersCollection.updateOne(
+          { applicationId: new ObjectId(applicationId) },
+          { $set: { status, feedback } }
+        );
+        console.log(resultAppliedTrainer);
+        const resultUser = await usersCollection.updateOne(
+          { _id: new ObjectId(userId) },
+          { $set: { role: "trainer" } }
+        );
+        res.status(200).send({ resultAppliedTrainer, resultUser });
+      } catch (error) {
+        console.error("Error handling application:", error);
         res.status(500).send({ message: "Internal Server Error" });
       }
     });
