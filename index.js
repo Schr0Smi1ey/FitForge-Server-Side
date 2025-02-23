@@ -130,6 +130,7 @@ async function run() {
           userId: user._id,
           applicationId: trainerId,
           status: "pending",
+          applyDate: trainerData.applyDate,
           feedback: "",
         };
 
@@ -146,6 +147,63 @@ async function run() {
         res.status(500).json({ error: "Internal server error" });
       }
     });
+    app.get("/trainers", async (req, res) => {
+      try {
+        const trainers = await trainersCollection
+          .aggregate([
+            {
+              $lookup: {
+                from: "AppliedTrainers",
+                localField: "_id",
+                foreignField: "applicationId",
+                as: "applications",
+              },
+            },
+            {
+              $match: { "applications.status": "accepted" },
+            },
+            // {
+            //   $project: {
+            //     _id: 1,
+            //     name: 1,
+            //     email: 1,
+            //     expertise: 1,
+            //     applications: 0, // Exclude applications field from response
+            //   },
+            // },
+          ])
+          .toArray();
+        res.send(trainers);
+      } catch (error) {
+        console.error("Error fetching trainers:", error);
+        res.status(500).send({ message: "Internal Server Error" });
+      }
+    });
+    const { ObjectId } = require("mongodb");
+
+    app.delete("/trainers", async (req, res) => {
+      try {
+        const trainerId = req.body.trainerId;
+        const userId = req.body.userId;
+        const result = await trainersCollection.deleteOne({
+          _id: new ObjectId(trainerId),
+        });
+        const resUser = await usersCollection.updateOne(
+          { _id: new ObjectId(userId) },
+          { $set: { role: "member" } }
+        );
+        const resAppliedTrainers = await appliedTrainersCollection.updateOne(
+          { applicationId: new ObjectId(trainerId) },
+          { $set: { status: "cancelled" } }
+        );
+
+        res.send({ result, resUser, resAppliedTrainers });
+      } catch (error) {
+        console.error("Error deleting trainer:", error);
+        res.status(500).send({ message: "Internal Server Error" });
+      }
+    });
+
     app.get("/appliedTrainers", async (req, res) => {
       try {
         const applicantEmail = req.query.email;
@@ -178,7 +236,6 @@ async function run() {
         if (!appliedTrainers.length) {
           return res.send([]);
         }
-
         const userIds = appliedTrainers.map((trainer) => trainer.userId);
         const applicationIds = appliedTrainers.map(
           (trainer) => trainer.applicationId
@@ -208,7 +265,7 @@ async function run() {
           feedback: appliedTrainer.feedback,
         }));
         console.log(response);
-        res.send(response);
+        return res.send(response);
       } catch (error) {
         console.error("Error fetching applied trainers:", error);
         res.status(500).send({ message: "Internal Server Error" });
@@ -230,11 +287,19 @@ async function run() {
           { $set: { status, feedback } }
         );
         console.log(resultAppliedTrainer);
-        const resultUser = await usersCollection.updateOne(
-          { _id: new ObjectId(userId) },
-          { $set: { role: "trainer" } }
-        );
-        res.status(200).send({ resultAppliedTrainer, resultUser });
+        if (status === "rejected") {
+          const res = await trainersCollection.deleteOne({
+            _id: new ObjectId(applicationId),
+          });
+        }
+        if (status === "accepted") {
+          const resultUser = await usersCollection.updateOne(
+            { _id: new ObjectId(userId) },
+            { $set: { role: "trainer" } }
+          );
+          return res.status(200).send({ resultAppliedTrainer, resultUser });
+        }
+        return res.status(200).send({ resultAppliedTrainer });
       } catch (error) {
         console.error("Error handling application:", error);
         res.status(500).send({ message: "Internal Server Error" });
