@@ -35,12 +35,56 @@ const forumsCollection = database.collection("Forums");
 const trainersCollection = database.collection("Trainers");
 const appliedTrainersCollection = database.collection("AppliedTrainers");
 
+const verifyToken = (req, res, next) => {
+  if (!req.headers.authorization) {
+    return res.status(401).send({ message: "unauthorized access" });
+  }
+  const token = req.headers.authorization.split(" ")[1];
+  jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, (err, decoded) => {
+    if (err) {
+      return res.status(401).send({ message: "unauthorized access" });
+    }
+    req.decoded = decoded;
+    next();
+  });
+};
+
+const verifyAdmin = async (req, res, next) => {
+  const email = req.decoded.email;
+  const query = { email: email };
+  const user = await usersCollection.findOne(query);
+  const isAdmin = user?.role === "admin";
+  if (!isAdmin) {
+    return res.status(403).send({ message: "forbidden access" });
+  }
+  next();
+};
+
 async function run() {
   try {
     app.get("/", (req, res) => {
       res.send("Welcome to the FitForge API");
     });
 
+    // Auth related APIs
+    app.post("/jwt", async (req, res) => {
+      const user = req.body;
+      const token = jwt.sign(user, process.env.ACCESS_TOKEN_SECRET, {
+        expiresIn: "1h",
+      });
+      res.send({ token });
+    });
+    app.get("/isAdmin", verifyToken, async (req, res) => {
+      const email = req.query.email;
+      if (email !== req.decoded.email) {
+        return res.status(403).send({ message: "forbidden access" });
+      }
+      const query = { email: email };
+      const user = await usersCollection.findOne(query);
+      const isAdmin = user?.role === "admin";
+      console.log(isAdmin);
+      res.send({ isAdmin });
+    });
     // Users
     app.post("/users", async (req, res) => {
       const newUser = req.body;
@@ -280,9 +324,12 @@ async function run() {
       }
     });
     // TODO: Not final yet
-    app.get("/appliedTrainers", async (req, res) => {
+    app.get("/appliedTrainers", verifyToken, async (req, res) => {
       try {
         const applicantEmail = req.query.email;
+        if (applicantEmail !== req.decoded.email) {
+          return res.status(403).send({ message: "forbidden access" });
+        }
         if (applicantEmail) {
           const user = await usersCollection.findOne({
             email: { $regex: new RegExp(`^${applicantEmail}$`, "i") },
@@ -451,7 +498,7 @@ async function run() {
         res.send({ error: "Internal server error" });
       }
     });
-
+    // TODO: Not final yet
     app.get("/slot", async (req, res) => {
       try {
         const email = req.query.email;
@@ -522,7 +569,7 @@ async function run() {
         res.status(500).json({ error: "Internal server error" });
       }
     });
-
+    // TODO: Not final yet
     app.delete("/slot", async (req, res) => {
       const { email, slotId } = req.query;
       const user = await usersCollection.findOne({
