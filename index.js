@@ -55,13 +55,25 @@ async function run() {
       res.send(result);
     });
     app.get("/user", async (req, res) => {
-      const email = req.query.email;
-      const query = { email: email };
-      const user = await usersCollection.findOne(query);
+      const user = await usersCollection.findOne({
+        email: { $regex: new RegExp(`^${req.query.email}$`, "i") },
+      });
       if (!user) {
         res.status(404).send("User not found");
         return;
       }
+      const role = req.query?.role;
+      if (role) {
+        if (role === "trainer") {
+          const trainer = await trainersCollection.findOne({
+            userId: user._id,
+          });
+          if (trainer) {
+            return res.send({ user, trainer });
+          }
+        }
+      }
+
       res.send(user);
     });
     // Classes
@@ -77,6 +89,7 @@ async function run() {
         const limit = parseInt(req.query.limit) || 6;
         const skip = (page - 1) * limit;
         const home = req.query?.home;
+        const slotForm = req.query?.slotForm;
         if (home) {
           const classes = await classesCollection
             .find()
@@ -85,6 +98,14 @@ async function run() {
             .toArray();
           return res.json(classes);
         }
+        if (slotForm) {
+          const classes = await classesCollection
+            .find({}, { projection: { title: 1, _id: 1, duration: 1 } })
+            .toArray();
+          console.log(classes);
+          return res.send(classes);
+        }
+
         const classes = await classesCollection
           .find()
           .sort({ postedDate: -1 })
@@ -390,6 +411,48 @@ async function run() {
       const user = await usersCollection.findOne({ _id: trainer.userId });
       res.send({ trainer, user });
     });
+
+    const { ObjectId } = require("mongodb");
+
+    app.post("/add-slot", async (req, res) => {
+      try {
+        const { trainerId, slot } = req.body;
+
+        // Find trainer by ID
+        const trainer = await trainersCollection.findOne({
+          _id: new ObjectId(trainerId),
+        });
+
+        if (!trainer) {
+          return res.send({ error: "Trainer not found" });
+        }
+
+        if (!trainer.classDuration || slot.slotTime > trainer.classDuration) {
+          return res.send({
+            error: "Slot time cannot be greater than class duration",
+          });
+        }
+
+        const updatedTrainer = await trainersCollection.updateOne(
+          { _id: new ObjectId(trainerId) },
+          {
+            $push: { slots: slot },
+            $set: {
+              classDuration: trainer.classDuration - parseInt(slot.slotTime),
+            },
+          }
+        );
+
+        if (updatedTrainer.modifiedCount === 0) {
+          return res.status(500).json({ error: "Failed to add slot" });
+        }
+
+        res.status(201).json({ success: "Slot added successfully" });
+      } catch (error) {
+        res.send({ error: "Internal server error" });
+      }
+    });
+
     // TODO: Not final yet
     // Newsletter Subscribers
     app.post("/subscribers", async (req, res) => {
