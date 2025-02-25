@@ -69,6 +69,7 @@ async function run() {
             userId: user._id,
           });
           if (trainer) {
+            console.log(trainer);
             return res.send({ user, trainer });
           }
         }
@@ -412,13 +413,10 @@ async function run() {
       res.send({ trainer, user });
     });
 
-    const { ObjectId } = require("mongodb");
-
+    // TODO: Not final yet
     app.post("/add-slot", async (req, res) => {
       try {
         const { trainerId, slot } = req.body;
-
-        // Find trainer by ID
         const trainer = await trainersCollection.findOne({
           _id: new ObjectId(trainerId),
         });
@@ -432,7 +430,8 @@ async function run() {
             error: "Slot time cannot be greater than class duration",
           });
         }
-
+        const slotId = new ObjectId();
+        slot._id = slotId;
         const updatedTrainer = await trainersCollection.updateOne(
           { _id: new ObjectId(trainerId) },
           {
@@ -451,6 +450,108 @@ async function run() {
       } catch (error) {
         res.send({ error: "Internal server error" });
       }
+    });
+
+    app.get("/slot", async (req, res) => {
+      try {
+        const email = req.query.email;
+        const user = await usersCollection.findOne({
+          email: { $regex: new RegExp(`^${email}$`, "i") },
+        });
+
+        if (!user) {
+          return res.status(404).json({ error: "User not found" });
+        }
+
+        const trainer = await trainersCollection.findOne({ userId: user._id });
+
+        if (!trainer) {
+          return res.status(404).json({ error: "Trainer not found" });
+        }
+        const trainerSlots = await trainersCollection.aggregate([
+          {
+            $match: { _id: trainer._id },
+          },
+          {
+            $unwind: "$slots",
+          },
+          {
+            $set: {
+              "slots.selectedClass": {
+                $toObjectId: "$slots.selectedClass",
+              },
+            },
+          },
+          {
+            $lookup: {
+              from: "Classes",
+              localField: "slots.selectedClass",
+              foreignField: "_id",
+              as: "classInfo",
+            },
+          },
+          {
+            $unwind: {
+              path: "$classInfo",
+              preserveNullAndEmptyArrays: true,
+            },
+          },
+          {
+            $set: {
+              "slots.selectedClass": "$classInfo.title",
+            },
+          },
+          {
+            $group: {
+              _id: "$_id",
+              slots: { $push: "$slots" },
+            },
+          },
+          {
+            $project: {
+              _id: 0,
+              slots: 1,
+            },
+          },
+        ]);
+        const result = await trainerSlots.toArray();
+        console.log(result);
+        res.send(result[0].slots);
+      } catch (error) {
+        console.error("Error fetching slots:", error);
+        res.status(500).json({ error: "Internal server error" });
+      }
+    });
+
+    app.delete("/slot", async (req, res) => {
+      const { email, slotId } = req.query;
+      const user = await usersCollection.findOne({
+        email: { $regex: new RegExp(`^${email}$`, "i") },
+      });
+      if (!user) {
+        return res.status(404).json({ error: "User not found" });
+      }
+      const trainer = await trainersCollection.findOne({ userId: user._id });
+      if (!trainer) {
+        return res.status(404).json({ error: "Trainer not found" });
+      }
+      const slot = await trainersCollection.findOne({
+        _id: trainer._id,
+        "slots._id": new ObjectId(slotId),
+      });
+      if (!slot) {
+        return res.status(404).json({ error: "Slot not found" });
+      }
+      const updatedTrainer = await trainersCollection.updateOne(
+        { _id: trainer._id },
+        {
+          $pull: { slots: { _id: new ObjectId(slotId) } },
+        }
+      );
+      if (updatedTrainer.modifiedCount === 0) {
+        return res.status(500).json({ error: "Failed to delete slot" });
+      }
+      res.status(200).json({ success: "Slot deleted successfully" });
     });
 
     // TODO: Not final yet
