@@ -89,21 +89,15 @@ async function run() {
 
         const posts = await forumsCollection
           .find()
-          .sort({ "postedDate.date2": -1 })
+          .sort({ postedDate: -1 })
           .skip(skip)
           .limit(limit)
           .toArray();
 
-        const formattedPosts = posts.map(({ postedDate, ...rest }) => ({
-          ...rest,
-          date1: postedDate?.date1 || null,
-          date2: postedDate?.date2 || null,
-        }));
-
         const totalPosts = await forumsCollection.countDocuments();
 
         return res.json({
-          posts: formattedPosts,
+          posts,
           totalPages: Math.ceil(totalPosts / limit),
           currentPage: page,
         });
@@ -168,10 +162,7 @@ async function run() {
               error: "Your application is still in progress!",
             });
           }
-          const acceptedApplication = appliedTrainerDocs.find(
-            (app) => app.status === "accepted"
-          );
-          if (acceptedApplication) {
+          if (user.role === "trainer") {
             return res.send({
               error: "You are already a trainer with FitForge!",
             });
@@ -235,29 +226,6 @@ async function run() {
       }
     });
     const { ObjectId } = require("mongodb");
-
-    app.delete("/trainers", async (req, res) => {
-      try {
-        const trainerId = req.body.trainerId;
-        const userId = req.body.userId;
-        const result = await trainersCollection.deleteOne({
-          _id: new ObjectId(trainerId),
-        });
-        const resUser = await usersCollection.updateOne(
-          { _id: new ObjectId(userId) },
-          { $set: { role: "member" } }
-        );
-        const resAppliedTrainers = await appliedTrainersCollection.updateOne(
-          { applicationId: new ObjectId(trainerId) },
-          { $set: { status: "cancelled" } }
-        );
-
-        res.send({ result, resUser, resAppliedTrainers });
-      } catch (error) {
-        console.error("Error deleting trainer:", error);
-        res.status(500).send({ message: "Internal Server Error" });
-      }
-    });
 
     app.get("/appliedTrainers", async (req, res) => {
       try {
@@ -328,38 +296,58 @@ async function run() {
     });
     app.patch("/handleApplication", async (req, res) => {
       try {
-        const handleData = req.body;
-        console.log(handleData);
-        const status = handleData.status;
-        const applicationId = handleData.applicationId;
-        const userId = handleData.userId;
-        let feedback = "";
-        if (status === "rejected") {
-          feedback = handleData.feedback;
-        }
+        const { status, applicationId, userId, feedback } = req.body;
+        console.log(req.body);
+        const appId = new ObjectId(applicationId);
+        const userObjId = new ObjectId(userId);
+
+        // Update the application status
         const resultAppliedTrainer = await appliedTrainersCollection.updateOne(
-          { applicationId: new ObjectId(applicationId) },
-          { $set: { status, feedback } }
+          { applicationId: appId },
+          {
+            $set: {
+              status,
+              feedback:
+                status === "rejected" || status === "cancelled" ? feedback : "",
+            },
+          }
         );
+
         console.log(resultAppliedTrainer);
-        if (status === "rejected") {
-          const res = await trainersCollection.deleteOne({
-            _id: new ObjectId(applicationId),
+
+        // Handle rejected/cancelled cases
+        if (status === "rejected" || status === "cancelled") {
+          const deleteTrainer = await trainersCollection.deleteOne({
+            _id: appId,
           });
+          const resultUser = await usersCollection.updateOne(
+            { _id: userObjId },
+            { $set: { role: "member" } }
+          );
+
+          return res
+            .status(200)
+            .send({ resultAppliedTrainer, deleteTrainer, resultUser });
         }
+
+        // Handle accepted case
         if (status === "accepted") {
           const resultUser = await usersCollection.updateOne(
-            { _id: new ObjectId(userId) },
+            { _id: userObjId },
             { $set: { role: "trainer" } }
           );
+
           return res.status(200).send({ resultAppliedTrainer, resultUser });
         }
+
+        // Default response
         return res.status(200).send({ resultAppliedTrainer });
       } catch (error) {
         console.error("Error handling application:", error);
-        res.status(500).send({ message: "Internal Server Error" });
+        return res.status(500).send({ message: "Internal Server Error" });
       }
     });
+
     app.get("/applicant-details/:id", async (req, res) => {
       const trainerId = req.params.id;
       const trainer = await trainersCollection.findOne({
