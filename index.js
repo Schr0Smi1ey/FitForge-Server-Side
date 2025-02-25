@@ -44,22 +44,26 @@ async function run() {
     // Users
     app.post("/users", async (req, res) => {
       const newUser = req.body;
-      const email = newUser.email;
-      const query = { email: email };
-      const user = await usersCollection.findOne(query);
+      const user = await usersCollection.findOne({
+        email: { $regex: new RegExp(`^${newUser.email}$`, "i") },
+      });
       if (user) {
-        res.status(400).send("User already exists");
+        res.status(400).send("Email already registered!");
         return;
       }
       const result = await usersCollection.insertOne(newUser);
       res.send(result);
     });
-    app.get("/users", async (req, res) => {
-      const cursor = usersCollection.find();
-      const result = await cursor.toArray();
-      res.send(result);
+    app.get("/user", async (req, res) => {
+      const email = req.query.email;
+      const query = { email: email };
+      const user = await usersCollection.findOne(query);
+      if (!user) {
+        res.status(404).send("User not found");
+        return;
+      }
+      res.send(user);
     });
-
     // Classes
     app.post("/classes", async (req, res) => {
       const newClass = req.body;
@@ -67,11 +71,36 @@ async function run() {
       const result = await classesCollection.insertOne(newClass);
       res.send(result);
     });
-
     app.get("/classes", async (req, res) => {
-      const cursor = classesCollection.find();
-      const result = await cursor.toArray();
-      res.send(result);
+      try {
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 6;
+        const skip = (page - 1) * limit;
+        const home = req.query?.home;
+        if (home) {
+          const classes = await classesCollection
+            .find()
+            .sort({ booked: -1, postedDate: -1 })
+            .limit(6)
+            .toArray();
+          return res.json(classes);
+        }
+        const classes = await classesCollection
+          .find()
+          .sort({ postedDate: -1 })
+          .skip(skip)
+          .limit(limit)
+          .toArray();
+        const totalClasses = await classesCollection.countDocuments();
+        return res.json({
+          classes,
+          totalPages: Math.ceil(totalClasses / limit),
+          currentPage: page,
+        });
+      } catch (error) {
+        console.error("Error fetching classes:", error);
+        res.status(500).json({ error: "Internal server error" });
+      }
     });
 
     // Forums
@@ -107,6 +136,7 @@ async function run() {
       }
     });
 
+    // TODO: Not final yet
     app.patch("/voteForums", async (req, res) => {
       const { forumId, vote } = req.body;
       console.log(forumId, vote);
@@ -136,6 +166,7 @@ async function run() {
       return res.json(result);
     });
     // Trainers
+    // TODO: Not final yet
     app.post("/trainers", async (req, res) => {
       try {
         const trainerData = req.body;
@@ -193,6 +224,7 @@ async function run() {
         res.status(500).json({ error: "Internal server error" });
       }
     });
+    // TODO: Not final yet
     app.get("/trainers", async (req, res) => {
       try {
         const trainers = await trainersCollection
@@ -225,8 +257,7 @@ async function run() {
         res.status(500).send({ message: "Internal Server Error" });
       }
     });
-    const { ObjectId } = require("mongodb");
-
+    // TODO: Not final yet
     app.get("/appliedTrainers", async (req, res) => {
       try {
         const applicantEmail = req.query.email;
@@ -236,6 +267,7 @@ async function run() {
           });
           const appliedTrainer = await appliedTrainersCollection
             .find({ userId: user._id })
+            .sort({ applyDate: -1 })
             .toArray();
           if (!appliedTrainer.length) {
             return res.send({ error: "No application found" });
@@ -254,6 +286,7 @@ async function run() {
 
         const appliedTrainers = await appliedTrainersCollection
           .find({ status: "pending" })
+          .sort({ applyDate: -1 })
           .toArray();
 
         if (!appliedTrainers.length) {
@@ -294,6 +327,7 @@ async function run() {
         res.status(500).send({ message: "Internal Server Error" });
       }
     });
+    // TODO: Not final yet
     app.patch("/handleApplication", async (req, res) => {
       try {
         const { status, applicationId, userId, feedback } = req.body;
@@ -347,8 +381,8 @@ async function run() {
         return res.status(500).send({ message: "Internal Server Error" });
       }
     });
-
-    app.get("/applicant-details/:id", async (req, res) => {
+    // TODO: Not final yet
+    app.get("/trainer-details/:id", async (req, res) => {
       const trainerId = req.params.id;
       const trainer = await trainersCollection.findOne({
         _id: new ObjectId(trainerId),
@@ -356,7 +390,7 @@ async function run() {
       const user = await usersCollection.findOne({ _id: trainer.userId });
       res.send({ trainer, user });
     });
-
+    // TODO: Not final yet
     // Newsletter Subscribers
     app.post("/subscribers", async (req, res) => {
       const newSubscriber = req.body;
@@ -370,6 +404,7 @@ async function run() {
       const result = await subscribersCollection.insertOne(newSubscriber);
       res.send(result);
     });
+    // TODO: Not final yet
     app.get("/subscribers", async (req, res) => {
       const cursor = subscribersCollection.find();
       const result = await cursor.toArray();
