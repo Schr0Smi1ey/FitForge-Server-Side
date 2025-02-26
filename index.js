@@ -41,6 +41,7 @@ const verifyToken = (req, res, next) => {
   if (!req.headers.authorization) {
     return res.status(401).send({ message: "unauthorized access" });
   }
+  console.log("verifyToken");
   const token = req.headers.authorization.split(" ")[1];
   jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, (err, decoded) => {
     if (err) {
@@ -53,10 +54,23 @@ const verifyToken = (req, res, next) => {
 
 const verifyAdmin = async (req, res, next) => {
   const email = req.decoded.email;
-  const query = { email: email };
-  const user = await usersCollection.findOne(query);
+  const user = await usersCollection.findOne({
+    email: { $regex: new RegExp(`^${email}$`, "i") },
+  });
   const isAdmin = user?.role === "admin";
   if (!isAdmin) {
+    return res.status(403).send({ message: "forbidden access" });
+  }
+  next();
+};
+
+const verifyTrainer = async (req, res, next) => {
+  const email = req.decoded.email;
+  const user = await usersCollection.findOne({
+    email: { $regex: new RegExp(`^${email}$`, "i") },
+  });
+  const isTrainer = user?.role === "trainer";
+  if (!isTrainer) {
     return res.status(403).send({ message: "forbidden access" });
   }
   next();
@@ -81,8 +95,9 @@ async function run() {
       if (email !== req.decoded.email) {
         return res.status(403).send({ message: "forbidden access" });
       }
-      const query = { email: email };
-      const user = await usersCollection.findOne(query);
+      const user = await usersCollection.findOne({
+        email: { $regex: new RegExp(`^${email}$`, "i") },
+      });
       const isAdmin = user?.role === "admin";
       console.log(isAdmin);
       res.send({ isAdmin });
@@ -100,14 +115,13 @@ async function run() {
       const result = await usersCollection.insertOne(newUser);
       res.send(result);
     });
-    app.get("/user", async (req, res) => {
+    app.get("/user", verifyToken, async (req, res) => {
+      if (req.query.email !== req.decoded.email) {
+        return res.status(403).send({ message: "forbidden access" });
+      }
       const user = await usersCollection.findOne({
         email: { $regex: new RegExp(`^${req.query.email}$`, "i") },
       });
-      if (!user) {
-        res.status(404).send("User not found");
-        return;
-      }
       const role = req.query?.role;
       if (role) {
         if (role === "trainer") {
@@ -119,6 +133,12 @@ async function run() {
           }
         }
       }
+      res.send({ user });
+    });
+    app.get("/posterInfo", async (req, res) => {
+      const user = await usersCollection.findOne({
+        email: { $regex: new RegExp(`^${req.query.email}$`, "i") },
+      });
       res.send({ user });
     });
     // Classes
@@ -170,12 +190,23 @@ async function run() {
     });
 
     // Forums
-    app.post("/forums", async (req, res) => {
+    //TODO: Not final yet
+    app.post("/forums", verifyToken, async (req, res) => {
+      const email = req.query.email;
+      if (email !== req.decoded.email) {
+        return res.status(403).send({ message: "forbidden access" });
+      }
+      const user = await usersCollection.findOne({
+        email: { $regex: new RegExp(`^${email}$`, "i") },
+      });
+      if (user.role !== "admin" && user.role !== "trainer") {
+        return res.status(403).send({ message: "forbidden access" });
+      }
       const newForum = req.body;
       const result = await forumsCollection.insertOne(newForum);
       res.send(result);
     });
-
+    //TODO: Not final yet
     app.get("/forums", async (req, res) => {
       try {
         const page = parseInt(req.query.page) || 1;
@@ -493,10 +524,13 @@ async function run() {
       res.send({ trainer, user });
     });
 
-    // TODO: Not final yet
-    app.post("/add-slot", async (req, res) => {
+    app.post("/add-slot", verifyToken, verifyTrainer, async (req, res) => {
       try {
         const { trainerId, slot } = req.body;
+        const email = req.query.email;
+        if (email !== req.decoded.email) {
+          return res.status(403).send({ message: "forbidden access" });
+        }
         const trainer = await trainersCollection.findOne({
           _id: new ObjectId(trainerId),
         });
@@ -525,29 +559,23 @@ async function run() {
         if (updatedTrainer.modifiedCount === 0) {
           return res.status(500).json({ error: "Failed to add slot" });
         }
-
         res.status(201).json({ success: "Slot added successfully" });
       } catch (error) {
         res.send({ error: "Internal server error" });
       }
     });
-    // TODO: Not final yet
-    app.get("/slot", async (req, res) => {
+    app.get("/slot", verifyToken, verifyTrainer, async (req, res) => {
       try {
         const email = req.query.email;
+        if (email !== req.decoded.email) {
+          return res.status(403).send({ message: "forbidden access" });
+        }
         const user = await usersCollection.findOne({
           email: { $regex: new RegExp(`^${email}$`, "i") },
         });
 
-        if (!user) {
-          return res.status(404).json({ error: "User not found" });
-        }
-
         const trainer = await trainersCollection.findOne({ userId: user._id });
 
-        if (!trainer) {
-          return res.status(404).json({ error: "Trainer not found" });
-        }
         const trainerSlots = await trainersCollection.aggregate([
           {
             $match: { _id: trainer._id },
@@ -595,16 +623,18 @@ async function run() {
           },
         ]);
         const result = await trainerSlots.toArray();
-        console.log(result);
         res.send(result[0].slots);
       } catch (error) {
         console.error("Error fetching slots:", error);
         res.status(500).json({ error: "Internal server error" });
       }
     });
-    // TODO: Not final yet
-    app.delete("/slot", async (req, res) => {
+    app.delete("/slot", verifyToken, verifyTrainer, async (req, res) => {
       const { email, slotId } = req.query;
+      console.log(email, slotId, req.decoded.email);
+      if (email !== req.decoded.email) {
+        return res.status(403).send({ message: "forbidden access" });
+      }
       const user = await usersCollection.findOne({
         email: { $regex: new RegExp(`^${email}$`, "i") },
       });
@@ -634,7 +664,7 @@ async function run() {
       res.status(200).json({ success: "Slot deleted successfully" });
     });
 
-    // TODO: Not final yet
+    // TODO: Had to implement secure Axios in the front end
     app.get("/book-trainer", async (req, res) => {
       try {
         const trainerId = req.query.trainerId;
@@ -702,11 +732,9 @@ async function run() {
       }
     });
 
-    app.post("/create-payment-intent", async (req, res) => {
+    app.post("/create-payment-intent", verifyToken, async (req, res) => {
       const { price } = req.body;
       const amount = parseInt(price * 100);
-      console.log(amount, "amount inside the intent");
-
       const paymentIntent = await stripe.paymentIntents.create({
         amount: amount,
         currency: "usd",
@@ -717,8 +745,12 @@ async function run() {
         clientSecret: paymentIntent.client_secret,
       });
     });
-    app.post("/payments", async (req, res) => {
+    app.post("/payments", verifyToken, async (req, res) => {
       const payment = req.body;
+      const email = req.query.email;
+      if (email !== req.decoded.email) {
+        return res.status(403).send({ message: "forbidden access" });
+      }
       const { slotId, trainerId } = payment;
       const classId = await trainersCollection.findOne(
         {
@@ -732,16 +764,14 @@ async function run() {
       const paymentResult = await paymentsCollection.insertOne(payment);
       res.send(paymentResult);
     });
-    app.get("/payments", async (req, res) => {
+    app.get("/payments", verifyToken, verifyAdmin, async (req, res) => {
       try {
         const email = req.query.email;
-        const matchStage = email
-          ? { $match: { email: email } }
-          : { $match: {} };
-
+        if (email !== req.decoded.email) {
+          return res.status(403).send({ message: "forbidden access" });
+        }
         const payments = await paymentsCollection
           .aggregate([
-            matchStage,
             {
               $lookup: {
                 from: "Trainers",
@@ -816,8 +846,74 @@ async function run() {
         res.status(500).json({ error: "Internal server error" });
       }
     });
+    app.get("/booked-trainers", verifyToken, async (req, res) => {
+      try {
+        const email = req.query.email;
+        if (email !== req.decoded.email) {
+          return res.status(403).send({ message: "forbidden access" });
+        }
+        const payments = await paymentsCollection
+          .aggregate([
+            {
+              $match: { email: email },
+            },
+            {
+              $lookup: {
+                from: "Trainers",
+                let: { trainerId: { $toObjectId: "$trainerId" } },
+                pipeline: [
+                  { $match: { $expr: { $eq: ["$_id", "$$trainerId"] } } },
+                ],
+                as: "trainerDetails",
+              },
+            },
+            { $unwind: "$trainerDetails" },
+            {
+              $lookup: {
+                from: "Classes",
+                let: { classId: { $toObjectId: "$classId" } },
+                pipeline: [
+                  { $match: { $expr: { $eq: ["$_id", "$$classId"] } } },
+                ],
+                as: "classDetails",
+              },
+            },
+            { $unwind: "$classDetails" },
+            {
+              $addFields: {
+                slotDetails: {
+                  $arrayElemAt: [
+                    {
+                      $filter: {
+                        input: "$trainerDetails.slots",
+                        as: "slot",
+                        cond: {
+                          $eq: ["$$slot._id", { $toObjectId: "$slotId" }],
+                        },
+                      },
+                    },
+                    0,
+                  ],
+                },
+              },
+            },
+            {
+              $project: {
+                trainerId: 0,
+                slotId: 0,
+                classId: 0,
+                "trainerDetails.slots": 0,
+              },
+            },
+          ])
+          .toArray();
+        res.send({ payments });
+      } catch (error) {
+        console.error("Error fetching payments:", error);
+        res.status(500).json({ error: "Internal server error" });
+      }
+    });
 
-    // TODO: Not final yet
     // Newsletter Subscribers
     app.post("/subscribers", async (req, res) => {
       const newSubscriber = req.body;
@@ -831,8 +927,13 @@ async function run() {
       const result = await subscribersCollection.insertOne(newSubscriber);
       res.send(result);
     });
-    // TODO: Not final yet
-    app.get("/subscribers", async (req, res) => {
+    app.get("/subscribers", verifyToken, verifyAdmin, async (req, res) => {
+      const email = req.query.email;
+      if (email !== req.decoded.email) {
+        return res.status(403).send({
+          message: "forbidden access",
+        });
+      }
       const cursor = subscribersCollection.find();
       const totalSubscribers =
         await subscribersCollection.estimatedDocumentCount();
