@@ -155,28 +155,49 @@ async function run() {
         const skip = (page - 1) * limit;
         const home = req.query?.home;
         const slotForm = req.query?.slotForm;
-        if (home) {
-          const classes = await classesCollection
-            .find()
-            .sort({ booked: -1, postedDate: -1 })
-            .limit(6)
-            .toArray();
-          return res.json(classes);
-        }
+        const sortCondition = home
+          ? { booked: -1, postedDate: -1 }
+          : { postedDate: -1 };
+
         if (slotForm) {
           const classes = await classesCollection
             .find({}, { projection: { title: 1, _id: 1, duration: 1 } })
             .toArray();
-          console.log(classes);
           return res.send(classes);
         }
 
         const classes = await classesCollection
-          .find()
-          .sort({ postedDate: -1 })
-          .skip(skip)
-          .limit(limit)
+          .aggregate([
+            { $sort: sortCondition },
+            { $skip: skip },
+            { $limit: limit },
+            {
+              $addFields: {
+                trainersObjectIds: {
+                  $map: {
+                    input: "$trainers",
+                    as: "trainerId",
+                    in: { $toObjectId: "$$trainerId" },
+                  },
+                },
+              },
+            },
+            {
+              $lookup: {
+                from: "Trainers",
+                localField: "trainersObjectIds",
+                foreignField: "_id",
+                as: "trainerDetails",
+              },
+            },
+            {
+              $project: {
+                trainersObjectIds: 0,
+              },
+            },
+          ])
           .toArray();
+
         const totalClasses = await classesCollection.countDocuments();
         return res.json({
           classes,
@@ -544,6 +565,27 @@ async function run() {
             error: "Slot time cannot be greater than class duration",
           });
         }
+        const canTake = await classesCollection.findOne({
+          _id: new ObjectId(slot.selectedClass),
+        });
+        if (canTake.trainers.length >= 5) {
+          return res.send({ error: "Already 5 trainers are assigned!" });
+        }
+        if (!canTake.trainers.includes(trainerId)) {
+          const result = await classesCollection.updateOne(
+            { _id: new ObjectId(slot.selectedClass) },
+            {
+              $push: { trainers: trainerId },
+            }
+          );
+          if (result.modifiedCount === 0) {
+            console.log("Failed to add trainer to class");
+            return res
+              .status(500)
+              .send({ error: "Failed to add slot in class" });
+          }
+        }
+
         const slotId = new ObjectId();
         slot._id = slotId;
         const updatedTrainer = await trainersCollection.updateOne(
@@ -555,12 +597,12 @@ async function run() {
             },
           }
         );
-
         if (updatedTrainer.modifiedCount === 0) {
-          return res.status(500).json({ error: "Failed to add slot" });
+          return res.status(500).send({ error: "Failed to add slot" });
         }
         res.status(201).json({ success: "Slot added successfully" });
       } catch (error) {
+        console.log("Error adding slot:", error);
         res.send({ error: "Internal server error" });
       }
     });
@@ -623,7 +665,8 @@ async function run() {
           },
         ]);
         const result = await trainerSlots.toArray();
-        res.send(result[0].slots);
+        const slots = result.length > 0 ? result[0].slots : [];
+        res.send(slots);
       } catch (error) {
         console.error("Error fetching slots:", error);
         res.status(500).json({ error: "Internal server error" });
@@ -631,34 +674,39 @@ async function run() {
     });
     app.delete("/slot", verifyToken, verifyTrainer, async (req, res) => {
       const { email, slotId } = req.query;
-      console.log(email, slotId, req.decoded.email);
       if (email !== req.decoded.email) {
         return res.status(403).send({ message: "forbidden access" });
       }
       const user = await usersCollection.findOne({
         email: { $regex: new RegExp(`^${email}$`, "i") },
       });
-      if (!user) {
-        return res.status(404).json({ error: "User not found" });
-      }
       const trainer = await trainersCollection.findOne({ userId: user._id });
-      if (!trainer) {
-        return res.status(404).json({ error: "Trainer not found" });
-      }
       const slot = await trainersCollection.findOne({
         _id: trainer._id,
         "slots._id": new ObjectId(slotId),
       });
-      if (!slot) {
-        return res.status(404).json({ error: "Slot not found" });
-      }
+      const slotData = slot.slots[0];
       const updatedTrainer = await trainersCollection.updateOne(
         { _id: trainer._id },
         {
           $pull: { slots: { _id: new ObjectId(slotId) } },
+          $set: {
+            classDuration:
+              trainer.classDuration + parseInt(slot.slots[0].slotTime),
+          },
         }
       );
-      if (updatedTrainer.modifiedCount === 0) {
+      const updateClass = await classesCollection.updateOne(
+        { _id: new ObjectId(slotData.selectedClass) },
+        {
+          $pull: { trainers: trainer._id.toString() },
+          $inc: { booked: -slotData.bookedMembers.length },
+        }
+      );
+      if (
+        updatedTrainer.modifiedCount === 0 ||
+        updateClass.modifiedCount === 0
+      ) {
         return res.status(500).json({ error: "Failed to delete slot" });
       }
       res.status(200).json({ success: "Slot deleted successfully" });
@@ -761,6 +809,23 @@ async function run() {
       );
       const selectedClass = classId ? classId.slots[0].selectedClass : null;
       payment.classId = selectedClass;
+      const updateSlot = await trainersCollection.updateOne(
+        {
+          _id: new ObjectId(trainerId),
+          "slots._id": new ObjectId(slotId),
+        },
+        {
+          $push: { "slots.$.bookedMembers": { email: email } },
+        }
+      );
+      const updateClass = await classesCollection.updateOne(
+        {
+          _id: new ObjectId(selectedClass),
+        },
+        {
+          $inc: { booked: 1 },
+        }
+      );
       const paymentResult = await paymentsCollection.insertOne(payment);
       res.send(paymentResult);
     });
@@ -907,6 +972,10 @@ async function run() {
             },
           ])
           .toArray();
+        console.log("Payments:", payments);
+        payments.forEach((payment) => {
+          console.log(payment.slotDetails);
+        });
         res.send({ payments });
       } catch (error) {
         console.error("Error fetching payments:", error);
