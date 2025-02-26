@@ -9,7 +9,11 @@ const port = process.env.PORT || 3000;
 // Middleware
 app.use(
   cors({
-    origin: ["http://localhost:5173"],
+    origin: [
+      "http://localhost:5173",
+      "https://fitforge-44b27.web.app",
+      "https://fitforge-44b27.firebaseapp.com",
+    ],
     methods: ["GET", "POST", "PUT", "DELETE", "PATCH"],
   })
 );
@@ -41,7 +45,6 @@ const verifyToken = (req, res, next) => {
   if (!req.headers.authorization) {
     return res.status(401).send({ message: "unauthorized access" });
   }
-  console.log("verifyToken");
   const token = req.headers.authorization.split(" ")[1];
   jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, (err, decoded) => {
     if (err) {
@@ -99,7 +102,6 @@ async function run() {
         email: { $regex: new RegExp(`^${email}$`, "i") },
       });
       const isAdmin = user?.role === "admin";
-      console.log(isAdmin);
       res.send({ isAdmin });
     });
     // Users
@@ -144,7 +146,6 @@ async function run() {
     // Classes
     app.post("/classes", async (req, res) => {
       const newClass = req.body;
-      console.log(newClass);
       const result = await classesCollection.insertOne(newClass);
       res.send(result);
     });
@@ -205,7 +206,6 @@ async function run() {
           currentPage: page,
         });
       } catch (error) {
-        console.error("Error fetching classes:", error);
         res.status(500).json({ error: "Internal server error" });
       }
     });
@@ -249,7 +249,6 @@ async function run() {
           currentPage: page,
         });
       } catch (error) {
-        console.error("Error fetching forums:", error);
         res.status(500).json({ error: "Internal server error" });
       }
     });
@@ -257,7 +256,6 @@ async function run() {
     // TODO: Not final yet
     app.patch("/voteForums", async (req, res) => {
       const { forumId, vote } = req.body;
-      console.log(forumId, vote);
       const post = await forumsCollection.findOne({
         _id: new ObjectId(forumId),
       });
@@ -287,14 +285,12 @@ async function run() {
     app.post("/trainers", verifyToken, async (req, res) => {
       try {
         const trainerData = req.body;
-        console.log(trainerData);
         if (req.decoded.email !== trainerData.email) {
           return res.status(403).send({ message: "forbidden access" });
         }
         const user = await usersCollection.findOne({
           email: { $regex: new RegExp(`^${trainerData.email}$`, "i") },
         });
-        console.log(user);
         if (!user) {
           return res.send({ error: "User not found" });
         }
@@ -339,7 +335,6 @@ async function run() {
           applicationId: appliedTrainerInsertResult.insertedId,
         });
       } catch (error) {
-        console.error("Error while processing trainer application", error);
         res.status(500).json({ error: "Internal server error" });
       }
     });
@@ -407,7 +402,6 @@ async function run() {
         }));
         return res.send(response);
       } catch (error) {
-        console.error("Error fetching applied trainers:", error);
         res.status(500).send({ message: "Internal Server Error" });
       }
     });
@@ -482,7 +476,6 @@ async function run() {
           }
           return res.status(200).send({ resultAppliedTrainer });
         } catch (error) {
-          console.error("Error handling application:", error);
           return res.status(500).send({ message: "Internal Server Error" });
         }
       }
@@ -579,7 +572,6 @@ async function run() {
             }
           );
           if (result.modifiedCount === 0) {
-            console.log("Failed to add trainer to class");
             return res
               .status(500)
               .send({ error: "Failed to add slot in class" });
@@ -602,7 +594,6 @@ async function run() {
         }
         res.status(201).json({ success: "Slot added successfully" });
       } catch (error) {
-        console.log("Error adding slot:", error);
         res.send({ error: "Internal server error" });
       }
     });
@@ -668,7 +659,6 @@ async function run() {
         const slots = result.length > 0 ? result[0].slots : [];
         res.send(slots);
       } catch (error) {
-        console.error("Error fetching slots:", error);
         res.status(500).json({ error: "Internal server error" });
       }
     });
@@ -775,7 +765,6 @@ async function run() {
         trainer.slots = result[0].slots;
         return res.send(trainer);
       } catch (error) {
-        console.error("Error fetching slots:", error);
         res.status(500).json({ error: "Internal server error" });
       }
     });
@@ -907,7 +896,6 @@ async function run() {
           uniqueMembers.length > 0 ? uniqueMembers[0].uniqueCount : 0;
         res.send({ totalPaidMembers, payments, totalBalance });
       } catch (error) {
-        console.error("Error fetching payments:", error);
         res.status(500).json({ error: "Internal server error" });
       }
     });
@@ -972,13 +960,8 @@ async function run() {
             },
           ])
           .toArray();
-        console.log("Payments:", payments);
-        payments.forEach((payment) => {
-          console.log(payment.slotDetails);
-        });
         res.send({ payments });
       } catch (error) {
-        console.error("Error fetching payments:", error);
         res.status(500).json({ error: "Internal server error" });
       }
     });
