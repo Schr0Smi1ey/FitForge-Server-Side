@@ -34,7 +34,9 @@ const classesCollection = database.collection("Classes");
 const forumsCollection = database.collection("Forums");
 const trainersCollection = database.collection("Trainers");
 const appliedTrainersCollection = database.collection("AppliedTrainers");
+const paymentsCollection = database.collection("Payments");
 
+const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 const verifyToken = (req, res, next) => {
   if (!req.headers.authorization) {
     return res.status(401).send({ message: "unauthorized access" });
@@ -113,13 +115,11 @@ async function run() {
             userId: user._id,
           });
           if (trainer) {
-            console.log(trainer);
             return res.send({ user, trainer });
           }
         }
       }
-
-      res.send(user);
+      res.send({ user });
     });
     // Classes
     app.post("/classes", async (req, res) => {
@@ -232,15 +232,16 @@ async function run() {
       return res.json(result);
     });
     // Trainers
-    // TODO: Not final yet
-    app.post("/trainers", async (req, res) => {
+    app.post("/trainers", verifyToken, async (req, res) => {
       try {
         const trainerData = req.body;
         console.log(trainerData);
+        if (req.decoded.email !== trainerData.email) {
+          return res.status(403).send({ message: "forbidden access" });
+        }
         const user = await usersCollection.findOne({
           email: { $regex: new RegExp(`^${trainerData.email}$`, "i") },
         });
-
         console.log(user);
         if (!user) {
           return res.send({ error: "User not found" });
@@ -290,74 +291,38 @@ async function run() {
         res.status(500).json({ error: "Internal server error" });
       }
     });
-    // TODO: Not final yet
     app.get("/trainers", async (req, res) => {
       try {
         const trainers = await trainersCollection
           .aggregate([
             {
               $lookup: {
-                from: "AppliedTrainers",
-                localField: "_id",
-                foreignField: "applicationId",
-                as: "applications",
+                from: "Users",
+                localField: "userId",
+                foreignField: "_id",
+                as: "users",
               },
             },
             {
-              $match: { "applications.status": "accepted" },
+              $match: { "users.role": "trainer" },
             },
-            // {
-            //   $project: {
-            //     _id: 1,
-            //     name: 1,
-            //     email: 1,
-            //     expertise: 1,
-            //     applications: 0, // Exclude applications field from response
-            //   },
-            // },
           ])
           .toArray();
         res.send(trainers);
       } catch (error) {
-        console.error("Error fetching trainers:", error);
-        res.status(500).send({ message: "Internal Server Error" });
+        res.status(500).send({ error: "Internal Server Error" });
       }
     });
-    // TODO: Not final yet
-    app.get("/appliedTrainers", verifyToken, async (req, res) => {
+    app.get("/appliedTrainers", verifyToken, verifyAdmin, async (req, res) => {
       try {
-        const applicantEmail = req.query.email;
-        if (applicantEmail !== req.decoded.email) {
+        const email = req.query.email;
+        if (email !== req.decoded.email) {
           return res.status(403).send({ message: "forbidden access" });
         }
-        if (applicantEmail) {
-          const user = await usersCollection.findOne({
-            email: { $regex: new RegExp(`^${applicantEmail}$`, "i") },
-          });
-          const appliedTrainer = await appliedTrainersCollection
-            .find({ userId: user._id })
-            .sort({ applyDate: -1 })
-            .toArray();
-          if (!appliedTrainer.length) {
-            return res.send({ error: "No application found" });
-          }
-          const trainer = await trainersCollection.findOne({
-            _id: appliedTrainer[0].applicationId,
-          });
-          return res.send([
-            {
-              user,
-              trainer,
-              appliedTrainer,
-            },
-          ]);
-        }
-
         const appliedTrainers = await appliedTrainersCollection
           .find({ status: "pending" })
           .sort({ applyDate: -1 })
           .toArray();
-
         if (!appliedTrainers.length) {
           return res.send([]);
         }
@@ -372,7 +337,6 @@ async function run() {
         const trainers = await trainersCollection
           .find({ _id: { $in: applicationIds } })
           .toArray();
-
         const userMap = users.reduce((acc, user) => {
           acc[user._id] = user;
           return acc;
@@ -389,74 +353,143 @@ async function run() {
           status: appliedTrainer.status,
           feedback: appliedTrainer.feedback,
         }));
-        console.log(response);
         return res.send(response);
       } catch (error) {
         console.error("Error fetching applied trainers:", error);
         res.status(500).send({ message: "Internal Server Error" });
       }
     });
-    // TODO: Not final yet
-    app.patch("/handleApplication", async (req, res) => {
-      try {
-        const { status, applicationId, userId, feedback } = req.body;
-        console.log(req.body);
-        const appId = new ObjectId(applicationId);
-        const userObjId = new ObjectId(userId);
-
-        // Update the application status
-        const resultAppliedTrainer = await appliedTrainersCollection.updateOne(
-          { applicationId: appId },
-          {
-            $set: {
-              status,
-              feedback:
-                status === "rejected" || status === "cancelled" ? feedback : "",
-            },
-          }
-        );
-
-        console.log(resultAppliedTrainer);
-
-        // Handle rejected/cancelled cases
-        if (status === "rejected" || status === "cancelled") {
-          const deleteTrainer = await trainersCollection.deleteOne({
-            _id: appId,
-          });
-          const resultUser = await usersCollection.updateOne(
-            { _id: userObjId },
-            { $set: { role: "member" } }
-          );
-
-          return res
-            .status(200)
-            .send({ resultAppliedTrainer, deleteTrainer, resultUser });
-        }
-
-        // Handle accepted case
-        if (status === "accepted") {
-          const resultUser = await usersCollection.updateOne(
-            { _id: userObjId },
-            { $set: { role: "trainer" } }
-          );
-
-          return res.status(200).send({ resultAppliedTrainer, resultUser });
-        }
-
-        // Default response
-        return res.status(200).send({ resultAppliedTrainer });
-      } catch (error) {
-        console.error("Error handling application:", error);
-        return res.status(500).send({ message: "Internal Server Error" });
+    app.get("/appliedTrainerInfo", verifyToken, async (req, res) => {
+      const applicantEmail = req.query.email;
+      const user = await usersCollection.findOne({
+        email: { $regex: new RegExp(`^${applicantEmail}$`, "i") },
+      });
+      const appliedTrainer = await appliedTrainersCollection
+        .find({ userId: user._id })
+        .sort({ applyDate: -1 })
+        .toArray();
+      if (!appliedTrainer.length) {
+        return res.send({ error: "No application found" });
       }
+      const trainer = await trainersCollection.findOne({
+        _id: appliedTrainer[0].applicationId,
+      });
+      return res.send([
+        {
+          user,
+          trainer,
+          appliedTrainer,
+        },
+      ]);
     });
-    // TODO: Not final yet
+    app.patch(
+      "/handleApplication",
+      verifyToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const { status, applicationId, userId, feedback, email } = req.body;
+          if (email !== req.decoded.email) {
+            return res.status(403).send({ message: "forbidden access" });
+          }
+          const appId = new ObjectId(applicationId);
+          const userObjId = new ObjectId(userId);
+          const resultAppliedTrainer =
+            await appliedTrainersCollection.updateOne(
+              { applicationId: appId },
+              {
+                $set: {
+                  status,
+                  feedback:
+                    status === "rejected" || status === "cancelled"
+                      ? feedback
+                      : "",
+                },
+              }
+            );
+          if (status === "rejected" || status === "cancelled") {
+            const deleteTrainer = await trainersCollection.deleteOne({
+              _id: appId,
+            });
+            const resultUser = await usersCollection.updateOne(
+              { _id: userObjId },
+              { $set: { role: "member" } }
+            );
+            return res
+              .status(200)
+              .send({ resultAppliedTrainer, deleteTrainer, resultUser });
+          }
+
+          if (status === "accepted") {
+            const resultUser = await usersCollection.updateOne(
+              { _id: userObjId },
+              { $set: { role: "trainer" } }
+            );
+
+            return res.status(200).send({ resultAppliedTrainer, resultUser });
+          }
+          return res.status(200).send({ resultAppliedTrainer });
+        } catch (error) {
+          console.error("Error handling application:", error);
+          return res.status(500).send({ message: "Internal Server Error" });
+        }
+      }
+    );
     app.get("/trainer-details/:id", async (req, res) => {
       const trainerId = req.params.id;
       const trainer = await trainersCollection.findOne({
         _id: new ObjectId(trainerId),
       });
       const user = await usersCollection.findOne({ _id: trainer.userId });
+      const result = await trainersCollection
+        .aggregate([
+          {
+            $match: { _id: new ObjectId(trainerId) },
+          },
+          {
+            $unwind: "$slots",
+          },
+          {
+            $set: {
+              "slots.selectedClass": {
+                $toObjectId: "$slots.selectedClass",
+              },
+            },
+          },
+          {
+            $lookup: {
+              from: "Classes",
+              localField: "slots.selectedClass",
+              foreignField: "_id",
+              as: "classInfo",
+            },
+          },
+          {
+            $unwind: {
+              path: "$classInfo",
+              preserveNullAndEmptyArrays: true,
+            },
+          },
+          {
+            $set: {
+              "slots.selectedClass": "$classInfo.title",
+            },
+          },
+          {
+            $group: {
+              _id: "$_id",
+              slots: { $push: "$slots" },
+            },
+          },
+          {
+            $project: {
+              _id: 0,
+              slots: 1,
+            },
+          },
+        ])
+        .toArray();
+      trainer.slots = result.length > 0 ? result[0].slots : [];
       res.send({ trainer, user });
     });
 
@@ -602,6 +635,189 @@ async function run() {
     });
 
     // TODO: Not final yet
+    app.get("/book-trainer", async (req, res) => {
+      try {
+        const trainerId = req.query.trainerId;
+        const slotId = req.query.slotId;
+        const trainer = await trainersCollection.findOne({
+          _id: new ObjectId(trainerId),
+        });
+        const trainerSlots = await trainersCollection.aggregate([
+          {
+            $match: {
+              _id: new ObjectId(trainerId),
+            },
+          },
+          {
+            $unwind: "$slots",
+          },
+          {
+            $match: { "slots._id": new ObjectId(slotId) },
+          },
+          {
+            $set: {
+              "slots.selectedClass": {
+                $toObjectId: "$slots.selectedClass",
+              },
+            },
+          },
+          {
+            $lookup: {
+              from: "Classes",
+              localField: "slots.selectedClass",
+              foreignField: "_id",
+              as: "classInfo",
+            },
+          },
+          {
+            $unwind: {
+              path: "$classInfo",
+              preserveNullAndEmptyArrays: true,
+            },
+          },
+          {
+            $set: {
+              "slots.selectedClass": "$classInfo.title",
+            },
+          },
+          {
+            $group: {
+              _id: "$_id",
+              slots: { $push: "$slots" },
+            },
+          },
+          {
+            $project: {
+              _id: 0,
+              slots: 1,
+            },
+          },
+        ]);
+        const result = await trainerSlots.toArray();
+        trainer.slots = result[0].slots;
+        return res.send(trainer);
+      } catch (error) {
+        console.error("Error fetching slots:", error);
+        res.status(500).json({ error: "Internal server error" });
+      }
+    });
+
+    app.post("/create-payment-intent", async (req, res) => {
+      const { price } = req.body;
+      const amount = parseInt(price * 100);
+      console.log(amount, "amount inside the intent");
+
+      const paymentIntent = await stripe.paymentIntents.create({
+        amount: amount,
+        currency: "usd",
+        payment_method_types: ["card"],
+      });
+
+      res.send({
+        clientSecret: paymentIntent.client_secret,
+      });
+    });
+    app.post("/payments", async (req, res) => {
+      const payment = req.body;
+      const { slotId, trainerId } = payment;
+      const classId = await trainersCollection.findOne(
+        {
+          _id: new ObjectId(trainerId),
+          "slots._id": new ObjectId(slotId),
+        },
+        { projection: { "slots.$": 1 } }
+      );
+      const selectedClass = classId ? classId.slots[0].selectedClass : null;
+      payment.classId = selectedClass;
+      const paymentResult = await paymentsCollection.insertOne(payment);
+      res.send(paymentResult);
+    });
+    app.get("/payments", async (req, res) => {
+      try {
+        const email = req.query.email;
+        const matchStage = email
+          ? { $match: { email: email } }
+          : { $match: {} };
+
+        const payments = await paymentsCollection
+          .aggregate([
+            matchStage,
+            {
+              $lookup: {
+                from: "Trainers",
+                let: { trainerId: { $toObjectId: "$trainerId" } },
+                pipeline: [
+                  { $match: { $expr: { $eq: ["$_id", "$$trainerId"] } } },
+                ],
+                as: "trainerDetails",
+              },
+            },
+            { $unwind: "$trainerDetails" },
+            {
+              $lookup: {
+                from: "Classes",
+                let: { classId: { $toObjectId: "$classId" } },
+                pipeline: [
+                  { $match: { $expr: { $eq: ["$_id", "$$classId"] } } },
+                ],
+                as: "classDetails",
+              },
+            },
+            { $unwind: "$classDetails" },
+            {
+              $addFields: {
+                slotDetails: {
+                  $arrayElemAt: [
+                    {
+                      $filter: {
+                        input: "$trainerDetails.slots",
+                        as: "slot",
+                        cond: {
+                          $eq: ["$$slot._id", { $toObjectId: "$slotId" }],
+                        },
+                      },
+                    },
+                    0,
+                  ],
+                },
+              },
+            },
+            {
+              $project: {
+                trainerId: 0,
+                slotId: 0,
+                classId: 0,
+                "trainerDetails.slots": 0,
+              },
+            },
+          ])
+          .toArray();
+        const uniqueMembers = await paymentsCollection
+          .aggregate([
+            {
+              $group: {
+                _id: "$email",
+              },
+            },
+            {
+              $count: "uniqueCount",
+            },
+          ])
+          .toArray();
+        const totalBalance = payments.reduce(
+          (acc, payment) => acc + payment.price,
+          0
+        );
+        const totalPaidMembers =
+          uniqueMembers.length > 0 ? uniqueMembers[0].uniqueCount : 0;
+        res.send({ totalPaidMembers, payments, totalBalance });
+      } catch (error) {
+        console.error("Error fetching payments:", error);
+        res.status(500).json({ error: "Internal server error" });
+      }
+    });
+
+    // TODO: Not final yet
     // Newsletter Subscribers
     app.post("/subscribers", async (req, res) => {
       const newSubscriber = req.body;
@@ -618,8 +834,10 @@ async function run() {
     // TODO: Not final yet
     app.get("/subscribers", async (req, res) => {
       const cursor = subscribersCollection.find();
+      const totalSubscribers =
+        await subscribersCollection.estimatedDocumentCount();
       const result = await cursor.toArray();
-      res.send(result);
+      res.send({ totalSubscribers, result });
     });
   } finally {
     // Ensures that the client will close when you finish/error
