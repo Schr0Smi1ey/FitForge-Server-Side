@@ -155,6 +155,7 @@ async function run() {
         const limit = parseInt(req.query.limit) || 6;
         const skip = (page - 1) * limit;
         const home = req.query?.home;
+        const search = req.query.search || "";
         const slotForm = req.query?.slotForm;
         const sortCondition = home
           ? { booked: -1, postedDate: -1 }
@@ -166,9 +167,15 @@ async function run() {
             .toArray();
           return res.send(classes);
         }
+        let filter = {};
+        if (search) {
+          console.log(search);
+          filter = { title: { $regex: `^${search}`, $options: "i" } };
+        }
 
         const classes = await classesCollection
           .aggregate([
+            { $match: filter },
             { $sort: sortCondition },
             { $skip: skip },
             { $limit: limit },
@@ -199,10 +206,10 @@ async function run() {
           ])
           .toArray();
 
-        const totalClasses = await classesCollection.countDocuments();
+        const totalClasses = await classesCollection.countDocuments(filter);
         return res.json({
           classes,
-          totalPages: Math.ceil(totalClasses / limit),
+          totalPages: Math.max(Math.ceil(totalClasses / limit), 1),
           currentPage: page,
         });
       } catch (error) {
