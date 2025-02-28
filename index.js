@@ -89,7 +89,7 @@ async function run() {
     app.post("/jwt", async (req, res) => {
       const user = req.body;
       const token = jwt.sign(user, process.env.ACCESS_TOKEN_SECRET, {
-        expiresIn: "1h",
+        expiresIn: "5h",
       });
       res.send({ token });
     });
@@ -139,7 +139,7 @@ async function run() {
     });
     app.get("/posterInfo", async (req, res) => {
       const user = await usersCollection.findOne({
-        email: { $regex: new RegExp(`^${req.query.email}$`, "i") },
+        email: { $regex: new RegExp(`^${req.query.postedBy}$`, "i") },
       });
       res.send({ user });
     });
@@ -149,6 +149,7 @@ async function run() {
       const result = await classesCollection.insertOne(newClass);
       res.send(result);
     });
+
     app.get("/classes", async (req, res) => {
       try {
         const page = parseInt(req.query.page) || 1;
@@ -169,7 +170,6 @@ async function run() {
         }
         let filter = {};
         if (search) {
-          console.log(search);
           filter = { title: { $regex: `^${search}`, $options: "i" } };
         }
 
@@ -218,7 +218,6 @@ async function run() {
     });
 
     // Forums
-    //TODO: Not final yet
     app.post("/forums", verifyToken, async (req, res) => {
       const email = req.query.email;
       if (email !== req.decoded.email) {
@@ -234,19 +233,46 @@ async function run() {
       const result = await forumsCollection.insertOne(newForum);
       res.send(result);
     });
-    //TODO: Not final yet
+    // TODO: get the user voting info
     app.get("/forums", async (req, res) => {
       try {
         const page = parseInt(req.query.page) || 1;
         const limit = parseInt(req.query.limit) || 6;
         const skip = (page - 1) * limit;
-
+        const email = req.query.email;
         const posts = await forumsCollection
           .find()
           .sort({ postedDate: -1 })
           .skip(skip)
           .limit(limit)
           .toArray();
+
+        if (email) {
+          const user = await usersCollection.findOne({
+            email: { $regex: new RegExp(`^${email}$`, "i") },
+          });
+
+          posts.forEach((post) => {
+            post.liked =
+              user?.likedPosts?.length > 0
+                ? user.likedPosts.some(
+                    (item) => item.toString() === post._id.toString()
+                  )
+                : false;
+
+            post.disliked =
+              user?.dislikedPosts?.length > 0
+                ? user.dislikedPosts.some(
+                    (item) => item.toString() === post._id.toString()
+                  )
+                : false;
+          });
+        } else {
+          posts.forEach((post) => {
+            post.liked = false;
+            post.disliked = false;
+          });
+        }
 
         const totalPosts = await forumsCollection.countDocuments();
 
@@ -260,33 +286,116 @@ async function run() {
       }
     });
 
-    // TODO: Not final yet
-    app.patch("/voteForums", async (req, res) => {
-      const { forumId, vote } = req.body;
-      const post = await forumsCollection.findOne({
-        _id: new ObjectId(forumId),
-      });
-      if (!post) {
-        return res.status(404).json({ error: "Post not found" });
-      }
-      const { totalUpVote, totalDownVote } = post;
-      let updatedUpvotes = totalUpVote;
-      let updatedDownvotes = totalDownVote;
-      if (vote === "up") {
-        updatedUpvotes += 1;
-      } else if (vote === "down") {
-        updatedDownvotes += 1;
-      }
-      const result = await forumsCollection.updateOne(
-        { _id: new ObjectId(forumId) },
-        {
-          $set: {
-            totalUpVote: updatedUpvotes,
-            totalDownVote: updatedDownvotes,
-          },
+    app.patch("/voteForums", verifyToken, async (req, res) => {
+      try {
+        const { forumId, vote } = req.body;
+        const email = req.query.email;
+
+        if (email !== req.decoded.email) {
+          return res.status(403).send({ message: "Forbidden access" });
         }
-      );
-      return res.json(result);
+
+        const post = await forumsCollection.findOne({
+          _id: new ObjectId(forumId),
+        });
+
+        if (!post) {
+          return res.status(404).json({ error: "Post not found" });
+        }
+
+        const { totalUpVote, totalDownVote } = post;
+        const user = await usersCollection.findOne({
+          email: { $regex: new RegExp(`^${email}$`, "i") },
+        });
+
+        if (!user) {
+          return res.status(404).json({ error: "User not found" });
+        }
+        let exists = 0;
+        if (vote === "up") {
+          if (!user.likedPosts.includes(forumId)) {
+            await usersCollection.updateOne(
+              { email: { $regex: new RegExp(`^${email}$`, "i") } },
+              { $push: { likedPosts: forumId } }
+            );
+
+            if (user.dislikedPosts.includes(forumId)) {
+              exists = 1;
+              await usersCollection.updateOne(
+                { email: { $regex: new RegExp(`^${email}$`, "i") } },
+                { $pull: { dislikedPosts: forumId } }
+              );
+            }
+
+            await forumsCollection.updateOne(
+              { _id: new ObjectId(forumId) },
+              {
+                $set: {
+                  totalUpVote: totalUpVote + 1,
+                  totalDownVote: totalDownVote - exists,
+                },
+              }
+            );
+          } else {
+            await usersCollection.updateOne(
+              { email: { $regex: new RegExp(`^${email}$`, "i") } },
+              { $pull: { likedPosts: forumId } }
+            );
+            await forumsCollection.updateOne(
+              { _id: new ObjectId(forumId) },
+              {
+                $set: {
+                  totalUpVote: totalUpVote - 1,
+                },
+              }
+            );
+          }
+        }
+
+        if (vote === "down") {
+          if (!user.dislikedPosts.includes(forumId)) {
+            await usersCollection.updateOne(
+              { email: { $regex: new RegExp(`^${email}$`, "i") } },
+              { $push: { dislikedPosts: forumId } }
+            );
+
+            if (user.likedPosts.includes(forumId)) {
+              exists = 1;
+              await usersCollection.updateOne(
+                { email: { $regex: new RegExp(`^${email}$`, "i") } },
+                { $pull: { likedPosts: forumId } }
+              );
+            }
+
+            await forumsCollection.updateOne(
+              { _id: new ObjectId(forumId) },
+              {
+                $set: {
+                  totalUpVote: totalUpVote - exists,
+                  totalDownVote: totalDownVote + 1,
+                },
+              }
+            );
+          } else {
+            await usersCollection.updateOne(
+              { email: { $regex: new RegExp(`^${email}$`, "i") } },
+              { $pull: { dislikedPosts: forumId } }
+            );
+            await forumsCollection.updateOne(
+              { _id: new ObjectId(forumId) },
+              {
+                $set: {
+                  totalDownVote: totalDownVote - 1,
+                },
+              }
+            );
+          }
+        }
+
+        res.send({ message: "Vote updated successfully" });
+      } catch (error) {
+        res.status(500).json({ error: "Internal Server Error" });
+      }
     });
     // Trainers
     app.post("/trainers", verifyToken, async (req, res) => {
