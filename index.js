@@ -144,7 +144,7 @@ async function run() {
       res.send({ user });
     });
     // Classes
-    app.post("/classes", async (req, res) => {
+    app.post("/classes", verifyToken, async (req, res) => {
       const newClass = req.body;
       const result = await classesCollection.insertOne(newClass);
       res.send(result);
@@ -914,7 +914,7 @@ async function run() {
       );
       const selectedClass = classId ? classId.slots[0].selectedClass : null;
       payment.classId = selectedClass;
-      const updateSlot = await trainersCollection.updateOne(
+      await trainersCollection.updateOne(
         {
           _id: new ObjectId(trainerId),
           "slots._id": new ObjectId(slotId),
@@ -923,7 +923,7 @@ async function run() {
           $push: { "slots.$.bookedMembers": { email: email } },
         }
       );
-      const updateClass = await classesCollection.updateOne(
+      await classesCollection.updateOne(
         {
           _id: new ObjectId(selectedClass),
         },
