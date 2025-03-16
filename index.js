@@ -39,6 +39,7 @@ const forumsCollection = database.collection("Forums");
 const trainersCollection = database.collection("Trainers");
 const appliedTrainersCollection = database.collection("AppliedTrainers");
 const paymentsCollection = database.collection("Payments");
+const reviewsCollection = database.collection("Reviews");
 
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 const verifyToken = (req, res, next) => {
@@ -653,7 +654,140 @@ async function run() {
       trainer.slots = result.length > 0 ? result[0].slots : [];
       res.send({ trainer, user });
     });
+    // TODO: Had to implement secure Axios in the front end
+    app.get("/book-trainer", async (req, res) => {
+      try {
+        const trainerId = req.query.trainerId;
+        const slotId = req.query.slotId;
+        const trainer = await trainersCollection.findOne({
+          _id: new ObjectId(trainerId),
+        });
+        const trainerSlots = await trainersCollection.aggregate([
+          {
+            $match: {
+              _id: new ObjectId(trainerId),
+            },
+          },
+          {
+            $unwind: "$slots",
+          },
+          {
+            $match: { "slots._id": new ObjectId(slotId) },
+          },
+          {
+            $set: {
+              "slots.selectedClass": {
+                $toObjectId: "$slots.selectedClass",
+              },
+            },
+          },
+          {
+            $lookup: {
+              from: "Classes",
+              localField: "slots.selectedClass",
+              foreignField: "_id",
+              as: "classInfo",
+            },
+          },
+          {
+            $unwind: {
+              path: "$classInfo",
+              preserveNullAndEmptyArrays: true,
+            },
+          },
+          {
+            $set: {
+              "slots.selectedClass": "$classInfo.title",
+            },
+          },
+          {
+            $group: {
+              _id: "$_id",
+              slots: { $push: "$slots" },
+            },
+          },
+          {
+            $project: {
+              _id: 0,
+              slots: 1,
+            },
+          },
+        ]);
+        const result = await trainerSlots.toArray();
+        trainer.slots = result[0].slots;
+        return res.send(trainer);
+      } catch (error) {
+        res.status(500).json({ error: "Internal server error" });
+      }
+    });
+    app.get("/booked-trainers", verifyToken, async (req, res) => {
+      try {
+        const email = req.query.email;
+        if (email !== req.decoded.email) {
+          return res.status(403).send({ message: "forbidden access" });
+        }
+        const payments = await paymentsCollection
+          .aggregate([
+            {
+              $match: { email: email },
+            },
+            {
+              $lookup: {
+                from: "Trainers",
+                let: { trainerId: { $toObjectId: "$trainerId" } },
+                pipeline: [
+                  { $match: { $expr: { $eq: ["$_id", "$$trainerId"] } } },
+                ],
+                as: "trainerDetails",
+              },
+            },
+            { $unwind: "$trainerDetails" },
+            {
+              $lookup: {
+                from: "Classes",
+                let: { classId: { $toObjectId: "$classId" } },
+                pipeline: [
+                  { $match: { $expr: { $eq: ["$_id", "$$classId"] } } },
+                ],
+                as: "classDetails",
+              },
+            },
+            { $unwind: "$classDetails" },
+            {
+              $addFields: {
+                slotDetails: {
+                  $arrayElemAt: [
+                    {
+                      $filter: {
+                        input: "$trainerDetails.slots",
+                        as: "slot",
+                        cond: {
+                          $eq: ["$$slot._id", { $toObjectId: "$slotId" }],
+                        },
+                      },
+                    },
+                    0,
+                  ],
+                },
+              },
+            },
+            {
+              $project: {
+                trainerId: 0,
+                slotId: 0,
+                classId: 0,
+                "trainerDetails.slots": 0,
+              },
+            },
+          ])
+          .toArray();
+        res.send({ payments });
+      } catch (error) {
+        res.status(500).json({ error: "Internal server error" });
+      }
+    });
 
+    // Slots
     app.post("/add-slot", verifyToken, verifyTrainer, async (req, res) => {
       try {
         const { trainerId, slot } = req.body;
@@ -818,73 +952,34 @@ async function run() {
       res.status(200).json({ success: "Slot deleted successfully" });
     });
 
-    // TODO: Had to implement secure Axios in the front end
-    app.get("/book-trainer", async (req, res) => {
-      try {
-        const trainerId = req.query.trainerId;
-        const slotId = req.query.slotId;
-        const trainer = await trainersCollection.findOne({
-          _id: new ObjectId(trainerId),
-        });
-        const trainerSlots = await trainersCollection.aggregate([
-          {
-            $match: {
-              _id: new ObjectId(trainerId),
-            },
-          },
-          {
-            $unwind: "$slots",
-          },
-          {
-            $match: { "slots._id": new ObjectId(slotId) },
-          },
-          {
-            $set: {
-              "slots.selectedClass": {
-                $toObjectId: "$slots.selectedClass",
-              },
-            },
-          },
+    // Reviews
+    app.post("/reviews", verifyToken, async (req, res) => {
+      const email = req.query.email;
+      if (email !== req.decoded.email) {
+        return res.status(403).send({ message: "forbidden access" });
+      }
+      const newReview = req.body;
+      newReview.email = email;
+      const result = await reviewsCollection.insertOne(newReview);
+      res.send(result);
+    });
+    app.get("/reviews", async (req, res) => {
+      // all reviews have email, i had to add correspond userData to each review
+      const reviews = await reviewsCollection
+        .aggregate([
           {
             $lookup: {
-              from: "Classes",
-              localField: "slots.selectedClass",
-              foreignField: "_id",
-              as: "classInfo",
+              from: "Users",
+              localField: "email",
+              foreignField: "email",
+              as: "userData",
             },
           },
-          {
-            $unwind: {
-              path: "$classInfo",
-              preserveNullAndEmptyArrays: true,
-            },
-          },
-          {
-            $set: {
-              "slots.selectedClass": "$classInfo.title",
-            },
-          },
-          {
-            $group: {
-              _id: "$_id",
-              slots: { $push: "$slots" },
-            },
-          },
-          {
-            $project: {
-              _id: 0,
-              slots: 1,
-            },
-          },
-        ]);
-        const result = await trainerSlots.toArray();
-        trainer.slots = result[0].slots;
-        return res.send(trainer);
-      } catch (error) {
-        res.status(500).json({ error: "Internal server error" });
-      }
+        ])
+        .toArray();
+      res.send(reviews);
     });
-
+    // Payments
     app.post("/create-payment-intent", verifyToken, async (req, res) => {
       const { price } = req.body;
       const amount = parseInt(price * 100);
@@ -1011,72 +1106,6 @@ async function run() {
         const totalPaidMembers =
           uniqueMembers.length > 0 ? uniqueMembers[0].uniqueCount : 0;
         res.send({ totalPaidMembers, payments, totalBalance });
-      } catch (error) {
-        res.status(500).json({ error: "Internal server error" });
-      }
-    });
-    app.get("/booked-trainers", verifyToken, async (req, res) => {
-      try {
-        const email = req.query.email;
-        if (email !== req.decoded.email) {
-          return res.status(403).send({ message: "forbidden access" });
-        }
-        const payments = await paymentsCollection
-          .aggregate([
-            {
-              $match: { email: email },
-            },
-            {
-              $lookup: {
-                from: "Trainers",
-                let: { trainerId: { $toObjectId: "$trainerId" } },
-                pipeline: [
-                  { $match: { $expr: { $eq: ["$_id", "$$trainerId"] } } },
-                ],
-                as: "trainerDetails",
-              },
-            },
-            { $unwind: "$trainerDetails" },
-            {
-              $lookup: {
-                from: "Classes",
-                let: { classId: { $toObjectId: "$classId" } },
-                pipeline: [
-                  { $match: { $expr: { $eq: ["$_id", "$$classId"] } } },
-                ],
-                as: "classDetails",
-              },
-            },
-            { $unwind: "$classDetails" },
-            {
-              $addFields: {
-                slotDetails: {
-                  $arrayElemAt: [
-                    {
-                      $filter: {
-                        input: "$trainerDetails.slots",
-                        as: "slot",
-                        cond: {
-                          $eq: ["$$slot._id", { $toObjectId: "$slotId" }],
-                        },
-                      },
-                    },
-                    0,
-                  ],
-                },
-              },
-            },
-            {
-              $project: {
-                trainerId: 0,
-                slotId: 0,
-                classId: 0,
-                "trainerDetails.slots": 0,
-              },
-            },
-          ])
-          .toArray();
-        res.send({ payments });
       } catch (error) {
         res.status(500).json({ error: "Internal server error" });
       }
