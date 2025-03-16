@@ -964,7 +964,6 @@ async function run() {
       res.send(result);
     });
     app.get("/reviews", async (req, res) => {
-      // all reviews have email, i had to add correspond userData to each review
       const reviews = await reviewsCollection
         .aggregate([
           {
@@ -1086,6 +1085,7 @@ async function run() {
               },
             },
           ])
+          .sort({ date: -1 })
           .toArray();
         const uniqueMembers = await paymentsCollection
           .aggregate([
