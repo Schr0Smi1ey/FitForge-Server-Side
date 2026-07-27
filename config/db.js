@@ -1,4 +1,24 @@
+const dns = require("dns");
 const { MongoClient, ServerApiVersion } = require("mongodb");
+
+// A mongodb+srv:// URI needs SRV and TXT lookups, which the driver performs
+// through Node's c-ares resolver — NOT through the OS resolver that dns.lookup()
+// and every other network call use. On some Windows machines c-ares fails to
+// enumerate the system's DNS servers and silently falls back to 127.0.0.1; with
+// nothing listening on port 53 there, every SRV lookup dies with
+// "querySrv ECONNREFUSED" even though the network is perfectly healthy and
+// nslookup resolves the same record fine.
+//
+// Setting DNS_SERVERS points c-ares at a resolver explicitly and fixes it. It is
+// opt-in and machine-specific (put it in .env, never commit a value) — leave it
+// unset anywhere the resolver works, including production.
+if (process.env.DNS_SERVERS) {
+  dns.setServers(
+    process.env.DNS_SERVERS.split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+  );
+}
 
 // MONGODB_URI wins when set, so tests and local runs can point at another cluster
 // (or an in-memory server) without editing this file. Falls back to the Atlas SRV

@@ -252,6 +252,27 @@ would stop every route from registering and the whole API would 404.
 | `Trainers.userId` | Trainer lookup by owning user |
 | `Payments.email + date desc` | Backs "my payments, newest first" |
 
+### `CRITICAL: could not ensure indexes … querySrv ECONNREFUSED`
+
+This is a **local DNS fault, not an Atlas or credentials problem**, and it takes
+down every database call — not just index creation.
+
+A `mongodb+srv://` URI requires SRV and TXT lookups, and the driver resolves those
+through Node's bundled c-ares resolver rather than the OS resolver used by
+`dns.lookup()` and ordinary connections. On some Windows machines c-ares cannot
+enumerate the system DNS servers and quietly defaults to `127.0.0.1`; with no
+local DNS server listening, every SRV query is refused. The giveaway is that
+`nslookup` succeeds while Node fails:
+
+```bash
+nslookup -type=SRV _mongodb._tcp.<cluster>.mongodb.net      # works
+node -e "require('dns').resolveSrv('_mongodb._tcp.<cluster>.mongodb.net',console.log)"   # ECONNREFUSED
+node -e "console.log(require('dns').getServers())"          # [ '127.0.0.1' ]  <-- the bug
+```
+
+Fix: set `DNS_SERVERS` in `.env` to a resolver that works (your router's IP, or
+`1.1.1.1`). `config/db.js` applies it via `dns.setServers()` at startup.
+
 ---
 
 ## Setup
@@ -270,6 +291,7 @@ npm start                 # http://localhost:3000
 | --- | --- |
 | `DB_USER`, `DB_PASS` | MongoDB Atlas credentials |
 | `MONGODB_URI` | Optional. Overrides the Atlas string; used by tests and local runs |
+| `DNS_SERVERS` | Optional, machine-specific. Only for `querySrv ECONNREFUSED` at boot — see below |
 | `ACCESS_TOKEN_SECRET` | Signs the JWTs issued by `POST /jwt` |
 | `STRIPE_SECRET_KEY` | Use the `sk_test_…` key outside production |
 | `STRIPE_WEBHOOK_SECRET` | **Bookings silently stop without this** — see below |
