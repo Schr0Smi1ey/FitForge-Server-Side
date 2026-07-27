@@ -17,12 +17,20 @@ app.use(
     methods: ["GET", "POST", "PUT", "DELETE", "PATCH"],
   })
 );
-app.use(express.json());
-app.use(cookieParser());
+// NOTE: express.json() is deliberately NOT mounted here. Stripe signature
+// verification needs the raw, unparsed request body, and Express applies
+// middleware in registration order — a global JSON parser mounted above the
+// webhook would consume the body and make every signature check fail. The
+// parser is mounted further down, immediately after the webhook route.
 
 const { getPackagePriceCents } = require("./config/pricing");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
-const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@schr0smi1ey.iioky.mongodb.net/?retryWrites=true&w=majority&appName=Schr0Smi1ey`;
+// MONGODB_URI wins when set, so tests and local runs can point at another
+// cluster (or an in-memory server) without editing this file. Falls back to the
+// Atlas SRV string built from DB_USER/DB_PASS.
+const uri =
+  process.env.MONGODB_URI ||
+  `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@schr0smi1ey.iioky.mongodb.net/?retryWrites=true&w=majority&appName=Schr0Smi1ey`;
 
 const client = new MongoClient(uri, {
   serverApi: {
@@ -43,6 +51,123 @@ const paymentsCollection = database.collection("Payments");
 const reviewsCollection = database.collection("Reviews");
 
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+
+/**
+ * Records a payment and books the slot it paid for.
+ *
+ * Called ONLY from the verified Stripe webhook — never from a client request —
+ * so the booking exists if and only if Stripe confirms money actually moved.
+ *
+ * Idempotent: the unique index on Payments.transactionId is the gate. Stripe
+ * retries a webhook until it gets a 2xx and can deliver the same event more than
+ * once, so the insert is attempted first and a duplicate-key error means this
+ * event was already fulfilled — we return instead of double-booking the slot.
+ */
+async function fulfillBooking({ transactionId, metadata }) {
+  const { trainerId, slotId, email, packageName } = metadata || {};
+  if (!trainerId || !slotId || !email || !packageName) {
+    throw new Error(`payment intent ${transactionId} is missing booking metadata`);
+  }
+  const priceCents = getPackagePriceCents(packageName);
+  if (priceCents === null) {
+    throw new Error(`payment intent ${transactionId} has unknown package ${packageName}`);
+  }
+  if (!ObjectId.isValid(trainerId) || !ObjectId.isValid(slotId)) {
+    throw new Error(`payment intent ${transactionId} has malformed trainerId/slotId`);
+  }
+
+  const trainerDoc = await trainersCollection.findOne(
+    { _id: new ObjectId(trainerId), "slots._id": new ObjectId(slotId) },
+    { projection: { "slots.$": 1 } }
+  );
+  const selectedClass = trainerDoc ? trainerDoc.slots[0].selectedClass : null;
+
+  try {
+    await paymentsCollection.insertOne({
+      email,
+      // Recomputed from packageName, never taken from a client.
+      price: priceCents / 100,
+      transactionId,
+      date: new Date().toISOString(),
+      packageName,
+      trainerId,
+      slotId,
+      classId: selectedClass,
+    });
+  } catch (err) {
+    if (err?.code === 11000) return { duplicate: true }; // already fulfilled
+    throw err;
+  }
+
+  // TODO(Phase 3): replace this $push with the atomic capacity-checked update.
+  // Today it can still overbook, but a booking now requires verified payment.
+  await trainersCollection.updateOne(
+    { _id: new ObjectId(trainerId), "slots._id": new ObjectId(slotId) },
+    { $push: { "slots.$.bookedMembers": { email } } }
+  );
+  if (selectedClass) {
+    await classesCollection.updateOne(
+      { _id: new ObjectId(selectedClass) },
+      { $inc: { booked: 1 } }
+    );
+  }
+  return { duplicate: false };
+}
+
+// Mounted BEFORE express.json() so req.body is the raw Buffer that
+// constructEvent needs. Moving this below the JSON parser silently breaks every
+// signature check, which is the classic way this integration fails.
+app.post(
+  "/webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    const secret = process.env.STRIPE_WEBHOOK_SECRET;
+    if (!secret) {
+      // Fail loudly rather than accepting unverified events.
+      console.error("STRIPE_WEBHOOK_SECRET is not set — refusing to process webhooks");
+      return res.status(500).send({ message: "Webhook not configured" });
+    }
+
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        req.headers["stripe-signature"],
+        secret
+      );
+    } catch (err) {
+      // Bad or absent signature: this did not come from Stripe. Touch nothing.
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    if (event.type === "payment_intent.succeeded") {
+      const intent = event.data.object;
+      try {
+        const { duplicate } = await fulfillBooking({
+          transactionId: intent.id,
+          metadata: intent.metadata,
+        });
+        console.log(
+          duplicate
+            ? `webhook: ${intent.id} already fulfilled, ignoring redelivery`
+            : `webhook: booked ${intent.id}`
+        );
+      } catch (err) {
+        console.error(`webhook: fulfillment failed for ${intent.id}:`, err.message);
+        // 5xx tells Stripe to retry, so a transient DB failure isn't a lost booking.
+        return res.status(500).send({ message: "Fulfillment failed" });
+      }
+    }
+
+    // 200 for every other event type too, otherwise Stripe retries them forever.
+    res.status(200).send({ received: true });
+  }
+);
+
+// Every route below this line gets a parsed JSON body.
+app.use(express.json());
+app.use(cookieParser());
+
 const verifyToken = (req, res, next) => {
   if (!req.headers.authorization) {
     return res.status(401).send({ message: "unauthorized access" });
@@ -83,6 +208,27 @@ const verifyTrainer = async (req, res, next) => {
 
 async function run() {
   try {
+    // This unique index IS the webhook's idempotency mechanism, not an
+    // optimisation — without it a Stripe redelivery would insert a second payment
+    // and book the slot twice. createIndex is idempotent, so running it on every
+    // boot is safe. (The remaining indexes land in Phase 4.)
+    //
+    // Deliberately non-fatal: if this await is allowed to throw, a momentarily
+    // unreachable database at boot stops every route below from ever registering
+    // and the whole API 404s. Log loudly instead and keep serving.
+    try {
+      await paymentsCollection.createIndex(
+        { transactionId: 1 },
+        { unique: true, name: "uniq_transactionId" }
+      );
+    } catch (err) {
+      console.error(
+        "CRITICAL: could not ensure the unique index on Payments.transactionId — " +
+          "webhook idempotency is NOT guaranteed until this succeeds:",
+        err.message
+      );
+    }
+
     app.get("/", (req, res) => {
       res.send("Welcome to the FitForge API");
     });
@@ -983,65 +1129,55 @@ async function run() {
     app.post("/create-payment-intent", verifyToken, async (req, res) => {
       // The amount is derived from the package name, never from the request body.
       // Trusting a client-sent `price` here let anyone charge themselves any amount.
-      const { packageName } = req.body;
+      const { packageName, trainerId, slotId } = req.body;
       const amount = getPackagePriceCents(packageName);
       if (amount === null) {
         return res.status(400).send({ message: "Invalid package name" });
+      }
+      if (!ObjectId.isValid(trainerId) || !ObjectId.isValid(slotId)) {
+        return res.status(400).send({ message: "Invalid trainerId or slotId" });
       }
       try {
         const paymentIntent = await stripe.paymentIntents.create({
           amount,
           currency: "usd",
           payment_method_types: ["card"],
+          // Everything the webhook needs to fulfil this booking travels with the
+          // intent itself, so fulfilment never depends on a second call from the
+          // client (which could lie, arrive late, or never arrive at all).
+          // email comes from the verified JWT, not the body.
+          metadata: {
+            trainerId,
+            slotId,
+            email: req.decoded.email,
+            packageName,
+          },
         });
         res.send({ clientSecret: paymentIntent.client_secret });
       } catch (err) {
         res.status(500).send({ message: "Could not create payment intent" });
       }
     });
+    // Cosmetic since Phase 2: the POST /webhook handler is the only thing that
+    // records a payment or books a slot, because only it can prove Stripe actually
+    // took the money. This endpoint no longer writes anything — it just reports
+    // whether the webhook has landed yet, so the client can show "processing"
+    // instead of claiming success before fulfilment happened.
     app.post("/payments", verifyToken, async (req, res) => {
-      const payment = req.body;
       const email = req.query.email;
       if (email !== req.decoded.email) {
         return res.status(403).send({ message: "forbidden access" });
       }
-      const { slotId, trainerId } = payment;
-      // Recompute the stored price from the package name rather than trusting the
-      // body. Otherwise a tampered `price` would land in the Payments collection and
-      // corrupt the revenue figures the admin dashboard reports.
-      const priceCents = getPackagePriceCents(payment.packageName);
-      if (priceCents === null) {
-        return res.status(400).send({ message: "Invalid package name" });
+      const { transactionId } = req.body;
+      if (!transactionId) {
+        return res.status(400).send({ message: "transactionId is required" });
       }
-      payment.price = priceCents / 100;
-      const classId = await trainersCollection.findOne(
-        {
-          _id: new ObjectId(trainerId),
-          "slots._id": new ObjectId(slotId),
-        },
-        { projection: { "slots.$": 1 } }
-      );
-      const selectedClass = classId ? classId.slots[0].selectedClass : null;
-      payment.classId = selectedClass;
-      await trainersCollection.updateOne(
-        {
-          _id: new ObjectId(trainerId),
-          "slots._id": new ObjectId(slotId),
-        },
-        {
-          $push: { "slots.$.bookedMembers": { email: email } },
-        }
-      );
-      await classesCollection.updateOne(
-        {
-          _id: new ObjectId(selectedClass),
-        },
-        {
-          $inc: { booked: 1 },
-        }
-      );
-      const paymentResult = await paymentsCollection.insertOne(payment);
-      res.send(paymentResult);
+      const payment = await paymentsCollection.findOne({ transactionId, email });
+      res.send({
+        // Webhooks are asynchronous, so "not yet" is a normal answer, not an error.
+        fulfilled: Boolean(payment),
+        payment: payment || null,
+      });
     });
     app.get("/payments", verifyToken, verifyAdmin, async (req, res) => {
       try {
