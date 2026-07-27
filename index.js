@@ -20,6 +20,7 @@ app.use(
 app.use(express.json());
 app.use(cookieParser());
 
+const { getPackagePriceCents } = require("./config/pricing");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@schr0smi1ey.iioky.mongodb.net/?retryWrites=true&w=majority&appName=Schr0Smi1ey`;
 
@@ -980,17 +981,23 @@ async function run() {
     });
     // Payments
     app.post("/create-payment-intent", verifyToken, async (req, res) => {
-      const { price } = req.body;
-      const amount = parseInt(price * 100);
-      const paymentIntent = await stripe.paymentIntents.create({
-        amount: amount,
-        currency: "usd",
-        payment_method_types: ["card"],
-      });
-
-      res.send({
-        clientSecret: paymentIntent.client_secret,
-      });
+      // The amount is derived from the package name, never from the request body.
+      // Trusting a client-sent `price` here let anyone charge themselves any amount.
+      const { packageName } = req.body;
+      const amount = getPackagePriceCents(packageName);
+      if (amount === null) {
+        return res.status(400).send({ message: "Invalid package name" });
+      }
+      try {
+        const paymentIntent = await stripe.paymentIntents.create({
+          amount,
+          currency: "usd",
+          payment_method_types: ["card"],
+        });
+        res.send({ clientSecret: paymentIntent.client_secret });
+      } catch (err) {
+        res.status(500).send({ message: "Could not create payment intent" });
+      }
     });
     app.post("/payments", verifyToken, async (req, res) => {
       const payment = req.body;
@@ -999,6 +1006,14 @@ async function run() {
         return res.status(403).send({ message: "forbidden access" });
       }
       const { slotId, trainerId } = payment;
+      // Recompute the stored price from the package name rather than trusting the
+      // body. Otherwise a tampered `price` would land in the Payments collection and
+      // corrupt the revenue figures the admin dashboard reports.
+      const priceCents = getPackagePriceCents(payment.packageName);
+      if (priceCents === null) {
+        return res.status(400).send({ message: "Invalid package name" });
+      }
+      payment.price = priceCents / 100;
       const classId = await trainersCollection.findOne(
         {
           _id: new ObjectId(trainerId),
