@@ -99,6 +99,9 @@ async function fulfillBooking({ transactionId, metadata }) {
       classId: selectedClass,
     });
   } catch (err) {
+    // A duplicate key here is the EXPECTED path for a webhook redelivery, not a
+    // failure, so it is not logged as one. Anything else propagates to the
+    // webhook handler, which logs it and returns 5xx so Stripe retries.
     if (err?.code === 11000) return { duplicate: true }; // already fulfilled
     throw err;
   }
@@ -155,6 +158,9 @@ app.post(
       );
     } catch (err) {
       // Bad or absent signature: this did not come from Stripe. Touch nothing.
+      // Worth logging — a burst here means either a misconfigured secret or
+      // someone probing the endpoint.
+      console.error("webhook: signature verification failed:", err.message);
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
 
@@ -423,6 +429,8 @@ async function run() {
           currentPage: page,
         });
       } catch (error) {
+        // Swallowing this made server-side failures invisible in the logs.
+        console.error(`${req.method} ${req.originalUrl} failed:`, error);
         res.status(500).json({ error: "Internal server error" });
       }
     });
@@ -492,6 +500,8 @@ async function run() {
           currentPage: page,
         });
       } catch (error) {
+        // Swallowing this made server-side failures invisible in the logs.
+        console.error(`${req.method} ${req.originalUrl} failed:`, error);
         res.status(500).json({ error: "Internal server error" });
       }
     });
@@ -604,6 +614,8 @@ async function run() {
 
         res.send({ message: "Vote updated successfully" });
       } catch (error) {
+        // Swallowing this made server-side failures invisible in the logs.
+        console.error(`${req.method} ${req.originalUrl} failed:`, error);
         res.status(500).json({ error: "Internal Server Error" });
       }
     });
@@ -661,6 +673,8 @@ async function run() {
           applicationId: appliedTrainerInsertResult.insertedId,
         });
       } catch (error) {
+        // Swallowing this made server-side failures invisible in the logs.
+        console.error(`${req.method} ${req.originalUrl} failed:`, error);
         res.status(500).json({ error: "Internal server error" });
       }
     });
@@ -683,6 +697,8 @@ async function run() {
           .toArray();
         res.send(trainers);
       } catch (error) {
+        // Swallowing this made server-side failures invisible in the logs.
+        console.error(`${req.method} ${req.originalUrl} failed:`, error);
         res.status(500).send({ error: "Internal Server Error" });
       }
     });
@@ -728,6 +744,8 @@ async function run() {
         }));
         return res.send(response);
       } catch (error) {
+        // Swallowing this made server-side failures invisible in the logs.
+        console.error(`${req.method} ${req.originalUrl} failed:`, error);
         res.status(500).send({ message: "Internal Server Error" });
       }
     });
@@ -802,6 +820,8 @@ async function run() {
           }
           return res.status(200).send({ resultAppliedTrainer });
         } catch (error) {
+          // Swallowing this made server-side failures invisible in the logs.
+          console.error(`${req.method} ${req.originalUrl} failed:`, error);
           return res.status(500).send({ message: "Internal Server Error" });
         }
       }
@@ -935,6 +955,8 @@ async function run() {
         trainer.slots = result[0].slots;
         return res.send(trainer);
       } catch (error) {
+        // Swallowing this made server-side failures invisible in the logs.
+        console.error(`${req.method} ${req.originalUrl} failed:`, error);
         res.status(500).json({ error: "Internal server error" });
       }
     });
@@ -1001,6 +1023,8 @@ async function run() {
           .toArray();
         res.send({ payments });
       } catch (error) {
+        // Swallowing this made server-side failures invisible in the logs.
+        console.error(`${req.method} ${req.originalUrl} failed:`, error);
         res.status(500).json({ error: "Internal server error" });
       }
     });
@@ -1079,6 +1103,8 @@ async function run() {
         }
         res.status(201).json({ success: "Slot added successfully" });
       } catch (error) {
+        // Swallowing this made server-side failures invisible in the logs.
+        console.error(`${req.method} ${req.originalUrl} failed:`, error);
         // Was `res.send(...)`, which returns HTTP 200 on an error path.
         console.error("POST /add-slot failed:", error);
         res.status(500).send({ message: "Internal server error" });
@@ -1146,6 +1172,8 @@ async function run() {
         const slots = result.length > 0 ? result[0].slots : [];
         res.send(slots);
       } catch (error) {
+        // Swallowing this made server-side failures invisible in the logs.
+        console.error(`${req.method} ${req.originalUrl} failed:`, error);
         res.status(500).json({ error: "Internal server error" });
       }
     });
@@ -1245,6 +1273,8 @@ async function run() {
         });
         res.send({ clientSecret: paymentIntent.client_secret });
       } catch (err) {
+        // Swallowing this made server-side failures invisible in the logs.
+        console.error(`${req.method} ${req.originalUrl} failed:`, err);
         res.status(500).send({ message: "Could not create payment intent" });
       }
     });
@@ -1348,6 +1378,8 @@ async function run() {
           uniqueMembers.length > 0 ? uniqueMembers[0].uniqueCount : 0;
         res.send({ totalPaidMembers, payments, totalBalance });
       } catch (error) {
+        // Swallowing this made server-side failures invisible in the logs.
+        console.error(`${req.method} ${req.originalUrl} failed:`, error);
         res.status(500).json({ error: "Internal server error" });
       }
     });
