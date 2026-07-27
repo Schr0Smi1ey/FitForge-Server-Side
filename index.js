@@ -1,7 +1,6 @@
 const express = require("express");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
-const cookieParser = require("cookie-parser");
 const app = express();
 require("dotenv").config();
 const port = process.env.PORT || 3000;
@@ -24,6 +23,7 @@ app.use(
 // parser is mounted further down, immediately after the webhook route.
 
 const { getPackagePriceCents } = require("./config/pricing");
+const { bookSlotAtomically } = require("./lib/booking");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 // MONGODB_URI wins when set, so tests and local runs can point at another
 // cluster (or an in-memory server) without editing this file. Falls back to the
@@ -51,6 +51,10 @@ const paymentsCollection = database.collection("Payments");
 const reviewsCollection = database.collection("Reviews");
 
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+
+// Seats per slot when a trainer doesn't specify one. Also the value the
+// migration backfills onto slots created before capacity existed.
+const DEFAULT_SLOT_CAPACITY = 10;
 
 /**
  * Records a payment and books the slot it paid for.
@@ -99,20 +103,34 @@ async function fulfillBooking({ transactionId, metadata }) {
     throw err;
   }
 
-  // TODO(Phase 3): replace this $push with the atomic capacity-checked update.
-  // Today it can still overbook, but a booking now requires verified payment.
-  await trainersCollection.updateOne(
-    { _id: new ObjectId(trainerId), "slots._id": new ObjectId(slotId) },
-    { $push: { "slots.$.bookedMembers": { email } } }
-  );
+  const booked = await bookSlotAtomically(trainersCollection, {
+    trainerId,
+    slotId,
+    email,
+    transactionId,
+  });
+  if (!booked) {
+    // Paid but unbookable (slot filled up, or this email already holds it).
+    // The payment row stays — it is a real charge — and is flagged so it can be
+    // reconciled or refunded rather than silently disappearing.
+    await paymentsCollection.updateOne(
+      { transactionId },
+      { $set: { fulfillmentStatus: "slot_unavailable" } }
+    );
+    return { duplicate: false, booked: false };
+  }
+
   if (selectedClass) {
     await classesCollection.updateOne(
       { _id: new ObjectId(selectedClass) },
       { $inc: { booked: 1 } }
     );
   }
-  return { duplicate: false };
+  return { duplicate: false, booked: true };
 }
+
+// The atomic booking query lives in lib/booking.js so the test suite can drive
+// the real implementation against an in-memory MongoDB instead of a copy of it.
 
 // Mounted BEFORE express.json() so req.body is the raw Buffer that
 // constructEvent needs. Moving this below the JSON parser silently breaks every
@@ -166,7 +184,16 @@ app.post(
 
 // Every route below this line gets a parsed JSON body.
 app.use(express.json());
-app.use(cookieParser());
+
+/**
+ * Wraps an async route so a rejected promise reaches Express's error handler.
+ *
+ * Express 4 does not await route handlers, so a throw inside one becomes an
+ * unhandled rejection and the request hangs until the client times out — it does
+ * not produce a 500. Every async route needs either this or its own try/catch.
+ */
+const asyncHandler = (fn) => (req, res, next) =>
+  Promise.resolve(fn(req, res, next)).catch(next);
 
 const verifyToken = (req, res, next) => {
   if (!req.headers.authorization) {
@@ -217,14 +244,33 @@ async function run() {
     // unreachable database at boot stops every route below from ever registering
     // and the whole API 404s. Log loudly instead and keep serving.
     try {
-      await paymentsCollection.createIndex(
-        { transactionId: 1 },
-        { unique: true, name: "uniq_transactionId" }
-      );
+      await Promise.all([
+        paymentsCollection.createIndex(
+          { transactionId: 1 },
+          { unique: true, name: "uniq_transactionId" }
+        ),
+        // Emails identify users everywhere in this app; the unique constraint is
+        // what actually prevents two accounts sharing one.
+        // Known gap: this index is case-SENSITIVE, while verifyAdmin/verifyTrainer
+        // look users up with a case-insensitive regex. "A@x.com" and "a@x.com"
+        // can therefore both exist, and would both match those guards. Closing it
+        // properly needs a collation-strength-2 index plus normalising the
+        // existing rows, so it is left as a deliberate follow-up.
+        usersCollection.createIndex(
+          { email: 1 },
+          { unique: true, name: "uniq_email" }
+        ),
+        trainersCollection.createIndex({ userId: 1 }, { name: "idx_userId" }),
+        // Backs the "my payments, newest first" dashboard query.
+        paymentsCollection.createIndex(
+          { email: 1, date: -1 },
+          { name: "idx_email_date" }
+        ),
+      ]);
     } catch (err) {
       console.error(
-        "CRITICAL: could not ensure the unique index on Payments.transactionId — " +
-          "webhook idempotency is NOT guaranteed until this succeeds:",
+        "CRITICAL: could not ensure indexes — webhook idempotency and uniqueness " +
+          "constraints are NOT guaranteed until this succeeds:",
         err.message
       );
     }
@@ -292,11 +338,27 @@ async function run() {
       res.send({ user });
     });
     // Classes
-    app.post("/classes", verifyToken, async (req, res) => {
-      const newClass = req.body;
-      const result = await classesCollection.insertOne(newClass);
-      res.send(result);
-    });
+    // verifyAdmin added in Phase 4: this was verifyToken-only, so ANY logged-in
+    // member could create classes.
+    app.post(
+      "/classes",
+      verifyToken,
+      verifyAdmin,
+      asyncHandler(async (req, res) => {
+        const { name, image, details } = req.body || {};
+        if (!name || typeof name !== "string") {
+          return res.status(400).send({ message: "Class name is required" });
+        }
+        const result = await classesCollection.insertOne({
+          name,
+          image,
+          details,
+          trainers: [],
+          booked: 0,
+        });
+        res.send(result);
+      })
+    );
 
     app.get("/classes", async (req, res) => {
       try {
@@ -801,11 +863,20 @@ async function run() {
       trainer.slots = result.length > 0 ? result[0].slots : [];
       res.send({ trainer, user });
     });
-    // TODO: Had to implement secure Axios in the front end
-    app.get("/book-trainer", async (req, res) => {
+    // Phase 4: resolves the old "TODO: Had to implement secure Axios in the front
+    // end". This drives the booking screen, so it should not be readable by
+    // anonymous callers; it was previously unauthenticated. Also validates the
+    // ids, since an invalid ObjectId used to throw and return a 500.
+    app.get("/book-trainer", verifyToken, async (req, res) => {
       try {
         const trainerId = req.query.trainerId;
         const slotId = req.query.slotId;
+        if (req.query.email && req.query.email !== req.decoded.email) {
+          return res.status(403).send({ message: "forbidden access" });
+        }
+        if (!ObjectId.isValid(trainerId) || !ObjectId.isValid(slotId)) {
+          return res.status(400).send({ message: "Invalid trainerId or slotId" });
+        }
         const trainer = await trainersCollection.findOne({
           _id: new ObjectId(trainerId),
         });
@@ -946,20 +1017,27 @@ async function run() {
           _id: new ObjectId(trainerId),
         });
 
+        // These all used to reply 200 with an { error } body, so the client saw a
+        // success status for a failed request.
         if (!trainer) {
-          return res.send({ error: "Trainer not found" });
+          return res.status(404).send({ message: "Trainer not found" });
         }
 
         if (!trainer.classDuration || slot.slotTime > trainer.classDuration) {
-          return res.send({
-            error: "Slot time cannot be greater than class duration",
+          return res.status(400).send({
+            message: "Slot time cannot be greater than class duration",
           });
         }
         const canTake = await classesCollection.findOne({
           _id: new ObjectId(slot.selectedClass),
         });
+        if (!canTake) {
+          return res.status(404).send({ message: "Selected class not found" });
+        }
         if (canTake.trainers.length >= 5) {
-          return res.send({ error: "Already 5 trainers are assigned!" });
+          return res
+            .status(409)
+            .send({ message: "Already 5 trainers are assigned!" });
         }
         if (!canTake.trainers.includes(trainerId)) {
           const result = await classesCollection.updateOne(
@@ -977,6 +1055,16 @@ async function run() {
 
         const slotId = new ObjectId();
         slot._id = slotId;
+        // Every slot needs a numeric capacity and an initialised bookedMembers
+        // array: the atomic booking filter compares $size against $capacity, and
+        // a missing field there compares against null and never matches, which
+        // would make the slot permanently unbookable.
+        const requestedCapacity = parseInt(slot.capacity, 10);
+        slot.capacity =
+          Number.isInteger(requestedCapacity) && requestedCapacity > 0
+            ? requestedCapacity
+            : DEFAULT_SLOT_CAPACITY;
+        slot.bookedMembers = [];
         const updatedTrainer = await trainersCollection.updateOne(
           { _id: new ObjectId(trainerId) },
           {
@@ -991,7 +1079,9 @@ async function run() {
         }
         res.status(201).json({ success: "Slot added successfully" });
       } catch (error) {
-        res.send({ error: "Internal server error" });
+        // Was `res.send(...)`, which returns HTTP 200 on an error path.
+        console.error("POST /add-slot failed:", error);
+        res.status(500).send({ message: "Internal server error" });
       }
     });
     app.get("/slot", verifyToken, verifyTrainer, async (req, res) => {
@@ -1288,13 +1378,40 @@ async function run() {
       const result = await cursor.toArray();
       res.send({ totalSubscribers, result });
     });
+    // Registered last, after every route, because Express matches middleware in
+    // order — mounted earlier it would shadow the routes below it.
+    app.use((req, res) => {
+      res.status(404).send({ message: "Not found" });
+    });
+
+    // Single error handler for the whole app. Express identifies it by its four
+    // arguments, so `next` must stay even though it is unused.
+    // eslint-disable-next-line no-unused-vars
+    app.use((err, req, res, next) => {
+      console.error(`${req.method} ${req.originalUrl} failed:`, err);
+      // Never leak a stack trace or driver message to the client.
+      const status = err.status || 500;
+      res.status(status).send({
+        message: status === 500 ? "Internal server error" : err.message,
+      });
+    });
   } finally {
-    // Ensures that the client will close when you finish/error
-    // await client.close();
+    // Intentionally NOT closing the client. This process is long-lived (and on
+    // Vercel the container is reused between invocations), so the driver's
+    // connection pool is meant to stay open for the lifetime of the process.
+    // Closing here would tear down the pool immediately after startup and every
+    // subsequent query would have to reconnect.
   }
 }
-run().catch(console.dir);
-// start the server
-app.listen(port, () => {
-  console.log("FitForge API is running on port " + port);
-});
+
+const ready = run().catch(console.dir);
+
+// Only listen when run directly. Required so the test suite can import `app`
+// and drive it with supertest without binding a port.
+if (require.main === module) {
+  app.listen(port, () => {
+    console.log("FitForge API is running on port " + port);
+  });
+}
+
+module.exports = { app, ready, fulfillBooking, bookSlotAtomically };
