@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main, enhanced]
+  pull_request:
+    branches: [main, enhanced]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # 20 is the current Vercel default; 22 catches breakage before upgrading.
+        node-version: [20.x, 22.x]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      # `npm ci` (not `npm install`) so the lockfile is honoured exactly and a
+      # drifted lockfile fails the build instead of being silently rewritten.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      # No service container needed: mongodb-memory-server downloads and runs a
+      # real mongod in-process, so the tests exercise genuine server behaviour
+      # (the atomic booking filter in particular) rather than a mock.
+      - name: Test
+        run: npm test
+        env:
+          CI: true
