@@ -5,7 +5,8 @@
   "scripts": {
     "test": "jest --runInBand --forceExit",
     "start": "node index.js",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "benchmark": "node scripts/benchmark.js"
   },
   "keywords": [],
   "author": "",
@@ -22,6 +23,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "autocannon": "^8.0.0",
     "eslint": "^10.8.0",
     "globals": "^17.8.0",
     "jest": "^30.4.2",

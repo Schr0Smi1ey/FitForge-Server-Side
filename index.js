@@ -42,6 +42,7 @@ app.use("/", require("./routes/trainers.routes"));
 app.use("/", require("./routes/reviews.routes"));
 app.use("/", require("./routes/payments.routes"));
 app.use("/", require("./routes/newsletter.routes"));
+app.use("/", require("./routes/adminStats.routes"));
 
 // Both must come after every route: Express matches middleware in order, so
 // mounted earlier these would shadow the routes above.
